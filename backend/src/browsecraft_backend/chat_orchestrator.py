@@ -33,8 +33,10 @@ _SYSTEM_PROMPT = (
     "You are BrowseCraft's Minecraft in-game assistant.\n"
     "Keep responses concise and action-oriented.\n"
     "Minecraft coordinates: +x=east, -x=west, +y=up, -y=down, +z=south, -z=north.\n"
-    "On flat terrain the ground is usually y=63 and player feet are usually y=64. "
-    "Ground-level builds should typically start around y=64 or y=65 unless user says otherwise.\n"
+    "Always anchor spatial reasoning to the live player_position for this request. "
+    "Do not assume default world heights like y=64.\n"
+    "Treat block_x/block_y/block_z from player_position as the authoritative local origin unless the user gives "
+    "explicit absolute coordinates.\n"
     "Do not create floating structures unless explicitly requested. Ensure builds are grounded or attached.\n"
     "Before modifying existing structures, inspect first. Use inspect_area with detailed=true when position-level data is needed.\n"
     "When using detailed inspections, keep filter_terrain=true unless terrain layout is directly relevant.\n"
@@ -42,6 +44,7 @@ _SYSTEM_PROMPT = (
     "If a request references walls/faces, map orientation using coordinates: south face = max z, north face = min z, "
     "east face = max x, west face = min x.\n"
     "For axis-aligned cuboids (walls, floors, roofs, boxes), prefer fill_region over enumerating many blocks.\n"
+    "For iterative edits, preserve existing structure and apply minimal diffs instead of rebuilding unrelated parts.\n"
     "For large custom builds, split work into multiple place_blocks calls instead of one huge placement list.\n"
     "If a placement batch is clearly wrong, call undo_last and retry with corrected coordinates.\n"
     "Use tools for factual game state instead of guessing."
@@ -49,6 +52,7 @@ _SYSTEM_PROMPT = (
 _MAX_TOOL_ROUNDS = 20
 _CONTEXT_MESSAGE_LIMIT = 12
 _MAX_MODEL_OUTPUT_TOKENS = 768
+_MAX_Y_DELTA_FROM_PLAYER = 96
 _CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 _TOOL_RESULT_SUMMARY_PREFIX = "[summarized tool_result]"
 _MEMORY_OUTCOME_TOOLS = {
@@ -168,6 +172,17 @@ _MODIFY_OVERLAY_TOOL_SCHEMA: dict[str, Any] = {
 
 class _BlueprintNameArgs(_ToolArgs):
     name: str = Field(min_length=1)
+
+
+class _PlayerPositionResult(BaseModel):
+    x: float
+    y: float
+    z: float
+    block_x: int
+    block_y: int
+    block_z: int
+    facing: str = Field(min_length=1)
+    dimension: str = Field(min_length=1)
 
 
 @dataclass(slots=True, frozen=True)
@@ -461,10 +476,19 @@ class ChatOrchestrator:
             world_id=world_id,
             user_message=user_message,
         )
-        system_prompt = _SYSTEM_PROMPT
+        player_position = await self._require_player_position(client_id=client_id)
+        system_prompt = (
+            f"{_SYSTEM_PROMPT}\n"
+            "Live player position for this request (authoritative):\n"
+            f"- x={player_position.x:.3f}, y={player_position.y:.3f}, z={player_position.z:.3f}\n"
+            f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
+            f"- facing={player_position.facing}, dimension={player_position.dimension}\n"
+            "All placement coordinates in this request must be derived from this live position unless the user "
+            "explicitly provided absolute coordinates."
+        )
         if memory_context:
             system_prompt = (
-                f"{_SYSTEM_PROMPT}\n"
+                f"{system_prompt}\n"
                 "Relevant long-term memory:\n"
                 f"{memory_context}"
             )
@@ -501,6 +525,7 @@ class ChatOrchestrator:
                         session_id=session_id,
                         tool_name=tool_use["name"],
                         raw_input=tool_use["input"],
+                        player_position=player_position,
                     )
                     tool_result = {
                         "type": "tool_result",
@@ -547,9 +572,15 @@ class ChatOrchestrator:
         session_id: str,
         tool_name: str,
         raw_input: Any,
+        player_position: _PlayerPositionResult,
     ) -> _ToolExecutionResult:
         try:
             params = _validate_tool_args(tool_name, raw_input)
+            _validate_placement_against_player_position(
+                tool_name=tool_name,
+                params=params,
+                player_position=player_position,
+            )
         except (ValidationError, ValueError) as exc:
             return _ToolExecutionResult(content=f"Invalid arguments for {tool_name}: {exc}", is_error=True)
 
@@ -570,6 +601,13 @@ class ChatOrchestrator:
 
     async def _dispatch_tool(self, client_id: str, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         return await self._websocket_manager.request_tool(client_id, tool_name, params)
+
+    async def _require_player_position(self, *, client_id: str) -> _PlayerPositionResult:
+        try:
+            raw_result = await self._dispatch_tool(client_id=client_id, tool_name="player_position", params={})
+            return _PlayerPositionResult.model_validate(raw_result)
+        except Exception as exc:
+            raise RuntimeError(f"Unable to read current player position: {exc}") from exc
 
     async def _resolve_session_for_chat(
         self,
@@ -841,6 +879,30 @@ def _validate_tool_args(tool_name: str, raw_input: Any) -> dict[str, Any]:
         parsed = _BlueprintNameArgs.model_validate(raw_input)
         return parsed.model_dump(mode="json")
     raise ValueError(f"Unsupported tool: {tool_name}")
+
+
+def _validate_placement_against_player_position(
+    *,
+    tool_name: str,
+    params: dict[str, Any],
+    player_position: _PlayerPositionResult,
+) -> None:
+    ys: list[int]
+    if tool_name == "place_blocks":
+        ys = [placement["y"] for placement in params["placements"]]
+    elif tool_name == "fill_region":
+        ys = [params["from_corner"]["y"], params["to_corner"]["y"]]
+    else:
+        return
+
+    min_y = min(ys)
+    max_y = max(ys)
+    player_y = player_position.block_y
+    if max_y < player_y - _MAX_Y_DELTA_FROM_PLAYER or min_y > player_y + _MAX_Y_DELTA_FROM_PLAYER:
+        raise ValueError(
+            f"{tool_name} y-range {min_y}..{max_y} is detached from current player block_y {player_y}; "
+            "derive placement coordinates from the live player_position for this request"
+        )
 
 
 def _summarize_historical_tool_results(messages: list[dict[str, Any]]) -> None:

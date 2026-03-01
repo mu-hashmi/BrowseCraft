@@ -55,6 +55,19 @@ class FakeWebSocketManager:
 
     async def request_tool(self, client_id: str, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         self.tool_requests.append((client_id, tool_name, params))
+        if tool_name == "player_position":
+            return {
+                "x": 10.5,
+                "y": 64.0,
+                "z": 20.5,
+                "yaw": 0.0,
+                "pitch": 0.0,
+                "block_x": 10,
+                "block_y": 64,
+                "block_z": 20,
+                "facing": "south",
+                "dimension": "minecraft:overworld",
+            }
         return {"tool": tool_name, "ok": True}
 
     async def send_payload(self, client_id: str, payload: dict[str, Any]) -> None:
@@ -64,6 +77,19 @@ class FakeWebSocketManager:
 class SummarizationWebSocketManager(FakeWebSocketManager):
     async def request_tool(self, client_id: str, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         self.tool_requests.append((client_id, tool_name, params))
+        if tool_name == "player_position":
+            return {
+                "x": 0.5,
+                "y": 64.0,
+                "z": 0.5,
+                "yaw": 0.0,
+                "pitch": 0.0,
+                "block_x": 0,
+                "block_y": 64,
+                "block_z": 0,
+                "facing": "south",
+                "dimension": "minecraft:overworld",
+            }
         if tool_name == "inspect_area":
             return {
                 "center": params["center"],
@@ -200,6 +226,7 @@ async def test_place_blocks_tool_routes_through_websocket_manager_and_emits_chat
     await orchestrator._run_chat(chat_id="chat-1", client_id="client-1", user_message="build a short wall")
 
     assert ws.tool_requests == [
+        ("client-1", "player_position", {}),
         (
             "client-1",
             "place_blocks",
@@ -219,6 +246,8 @@ async def test_place_blocks_tool_routes_through_websocket_manager_and_emits_chat
     assert first_call["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert first_call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
     assert {tool["name"] for tool in first_call["tools"]} == EXPECTED_TOOL_NAMES
+    assert "Live player position for this request (authoritative)" in first_call["system"][0]["text"]
+    assert "block_x=10, block_y=64, block_z=20" in first_call["system"][0]["text"]
 
     assert ws.sent_payloads[0][0] == "client-1"
     assert ws.sent_payloads[0][1]["type"] == "chat.response"
@@ -248,6 +277,7 @@ async def test_world_tool_routes_through_websocket_manager() -> None:
     await orchestrator._run_chat(chat_id="chat-2", client_id="client-2", user_message="scan nearby blocks")
 
     assert ws.tool_requests == [
+        ("client-2", "player_position", {}),
         (
             "client-2",
             "inspect_area",
@@ -285,7 +315,7 @@ async def test_invalid_tool_args_are_reported_back_to_model() -> None:
     assert tool_result["tool_use_id"] == "tool-call-1"
     assert tool_result["is_error"] is True
     assert "Invalid arguments for inspect_area" in tool_result["content"]
-    assert ws.tool_requests == []
+    assert ws.tool_requests == [("client-3", "player_position", {})]
     assert ws.sent_payloads[0][1]["payload"]["message"] == "Please provide center coordinates."
 
 
@@ -313,7 +343,35 @@ async def test_detailed_inspect_radius_limit_is_reported_back_to_model() -> None
     tool_result = second_call["messages"][-1]["content"][0]
     assert tool_result["is_error"] is True
     assert "inspect_area with detailed=true requires radius <= 6" in tool_result["content"]
-    assert ws.tool_requests == []
+    assert ws.tool_requests == [("client-limit", "player_position", {})]
+
+
+@pytest.mark.asyncio
+async def test_placement_far_from_live_player_height_is_rejected() -> None:
+    anthropic_client = FakeAnthropicClient(
+        responses=[
+            _tool_use_response(
+                "place_blocks",
+                {"placements": [{"x": 10, "y": 300, "z": 20, "block_id": "minecraft:stone"}]},
+            ),
+            _text_response("I'll re-check and use your actual position."),
+        ]
+    )
+    ws = FakeWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    await orchestrator._run_chat(chat_id="chat-y-range", client_id="client-y-range", user_message="build here")
+
+    second_call = anthropic_client.messages.calls[1]
+    tool_result = second_call["messages"][-1]["content"][0]
+    assert tool_result["is_error"] is True
+    assert "detached from current player block_y" in tool_result["content"]
+    assert ws.tool_requests == [("client-y-range", "player_position", {})]
+    assert ws.sent_payloads[0][1]["payload"]["message"] == "I'll re-check and use your actual position."
 
 
 @pytest.mark.asyncio

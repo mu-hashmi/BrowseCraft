@@ -34,6 +34,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -50,6 +51,8 @@ import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.lit
 
 public final class BrowseCraftClient implements ClientModInitializer {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final int CHAT_BUILD_TEST_TIMEOUT_TICKS = 20 * 90;
+    private static final int CHAT_BUILD_TEST_SETTLE_TICKS = 20;
     private static final Set<String> TERRAIN_BLOCK_IDS = Set.of(
             "minecraft:grass_block",
             "minecraft:dirt",
@@ -89,6 +92,15 @@ public final class BrowseCraftClient implements ClientModInitializer {
     private KeyBinding.Category keyCategory;
 
     private int buildTestCaptureTicksRemaining = -1;
+    private int chatBuildTestWaitTicksRemaining = -1;
+    private int chatBuildTestStableTicks;
+    private long overlayPlacementRevision;
+    private long chatBuildTestBaselineRevision;
+    private long chatBuildTestObservedRevision;
+    private String buildTestTrigger = "build-test";
+    private String buildTestPrompt;
+    private int toolCallSequence;
+    private final List<JsonObject> buildTestToolCalls = new ArrayList<>();
     private int inventoryPollCountdown;
     private volatile String latestStatusMessage = "";
 
@@ -274,6 +286,29 @@ public final class BrowseCraftClient implements ClientModInitializer {
                 }
             }
 
+            if (chatBuildTestWaitTicksRemaining >= 0) {
+                if (overlayPlacementRevision > chatBuildTestBaselineRevision) {
+                    if (overlayPlacementRevision != chatBuildTestObservedRevision) {
+                        chatBuildTestObservedRevision = overlayPlacementRevision;
+                        chatBuildTestStableTicks = 0;
+                    } else {
+                        chatBuildTestStableTicks++;
+                    }
+                    if (latestStatusMessage.startsWith("chat: ") && chatBuildTestStableTicks >= CHAT_BUILD_TEST_SETTLE_TICKS) {
+                        chatBuildTestWaitTicksRemaining = -1;
+                        buildTestCaptureTicksRemaining = 5;
+                    }
+                } else if (chatBuildTestWaitTicksRemaining == 0) {
+                    chatBuildTestWaitTicksRemaining = -1;
+                    latestStatusMessage = "CHAT_BUILD_TEST_TIMEOUT: no blocks placed";
+                    if (client.player != null) {
+                        client.player.sendMessage(Text.literal(latestStatusMessage), true);
+                    }
+                } else {
+                    chatBuildTestWaitTicksRemaining--;
+                }
+            }
+
             if (buildTestCaptureTicksRemaining >= 0) {
                 buildTestCaptureTicksRemaining--;
                 if (buildTestCaptureTicksRemaining == 0) {
@@ -288,11 +323,43 @@ public final class BrowseCraftClient implements ClientModInitializer {
             return;
         }
 
+        latestBuildTestJsonPath = null;
+        latestBuildTestScreenshotPath = null;
+        buildTestTrigger = "build-test";
+        buildTestPrompt = null;
+        resetBuildTestToolTrace();
+        chatBuildTestWaitTicksRemaining = -1;
         BuildPlan testPlan = createBuildTestPlan();
         overlayState.setPlan(testPlan);
         overlayState.setRotationQuarterTurns(rotationForFacing(client.player.getHorizontalFacing()));
         buildTestCaptureTicksRemaining = 5;
         client.player.sendMessage(Text.literal("Loaded /build-test plan"), true);
+    }
+
+    private void runChatBuildTestCommand(MinecraftClient client, String message, boolean resetOverlay) {
+        if (client.player == null) {
+            return;
+        }
+
+        latestBuildTestJsonPath = null;
+        latestBuildTestScreenshotPath = null;
+        buildTestTrigger = "chat";
+        buildTestPrompt = message;
+        resetBuildTestToolTrace();
+        buildTestCaptureTicksRemaining = -1;
+        chatBuildTestWaitTicksRemaining = CHAT_BUILD_TEST_TIMEOUT_TICKS;
+        chatBuildTestBaselineRevision = overlayPlacementRevision;
+        chatBuildTestObservedRevision = overlayPlacementRevision;
+        chatBuildTestStableTicks = 0;
+
+        if (resetOverlay) {
+            overlayState.cancel();
+            hasUndoState = false;
+            undoClearsOverlay = false;
+            undoBlueprintState = null;
+        }
+
+        commandController.submitChat(message);
     }
 
     private BuildPlan createBuildTestPlan() {
@@ -492,8 +559,21 @@ public final class BrowseCraftClient implements ClientModInitializer {
             Path screenshotPath = screenshotsDir.resolve("browsecraft-build-test-" + Instant.now().toEpochMilli() + ".png");
 
             JsonObject root = new JsonObject();
+            JsonObject test = new JsonObject();
+            test.addProperty("trigger", buildTestTrigger);
+            if (buildTestPrompt != null) {
+                test.addProperty("prompt", buildTestPrompt);
+            }
+            root.add("test", test);
             root.add("overlay", overlayToJson(snapshot));
             root.add("validation", validationToJson(snapshot));
+            JsonArray toolCalls = new JsonArray();
+            synchronized (buildTestToolCalls) {
+                for (JsonObject toolCall : buildTestToolCalls) {
+                    toolCalls.add(toolCall.deepCopy());
+                }
+            }
+            root.add("tool_calls", toolCalls);
             JsonObject backend = new JsonObject();
             backend.addProperty("latest_status_message", latestStatusMessage);
             root.add("backend", backend);
@@ -582,12 +662,12 @@ public final class BrowseCraftClient implements ClientModInitializer {
     }
 
     private JsonObject dispatchToolRequest(MinecraftClient client, String tool, JsonObject params) {
-        return switch (tool) {
+        JsonObject result = switch (tool) {
             case "player_position" -> toolPlayerPosition(client);
             case "player_inventory" -> toolPlayerInventory(client);
             case "inspect_area" -> toolInspectArea(client, params);
-            case "place_blocks" -> toolPlaceBlocks(params);
-            case "fill_region" -> toolFillRegion(params);
+            case "place_blocks" -> toolPlaceBlocks(client, params);
+            case "fill_region" -> toolFillRegion(client, params);
             case "undo_last" -> toolUndoLast();
             case "get_active_overlay" -> activeOverlaySummary(overlayState.snapshot());
             case "modify_overlay" -> toolModifyOverlay(params);
@@ -596,6 +676,8 @@ public final class BrowseCraftClient implements ClientModInitializer {
             case "load_blueprint" -> toolLoadBlueprint(client, params);
             default -> throw new IllegalArgumentException("Unsupported tool: " + tool);
         };
+        recordBuildTestToolCall(tool, params, result);
+        return result;
     }
 
     private JsonObject toolPlayerPosition(MinecraftClient client) {
@@ -712,7 +794,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
         return result;
     }
 
-    private JsonObject toolPlaceBlocks(JsonObject params) {
+    private JsonObject toolPlaceBlocks(MinecraftClient client, JsonObject params) {
         JsonElement placementsElement = params.get("placements");
         if (placementsElement == null || !placementsElement.isJsonArray()) {
             throw new IllegalArgumentException("Expected array field: placements");
@@ -740,7 +822,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
         return applyAbsolutePlacements(absolutePlacements);
     }
 
-    private JsonObject toolFillRegion(JsonObject params) {
+    private JsonObject toolFillRegion(MinecraftClient client, JsonObject params) {
         BlockPos fromCorner = requiredBlockPos(params, "from_corner");
         BlockPos toCorner = requiredBlockPos(params, "to_corner");
         String blockId = normalizeBlockId(requiredString(params, "block_id"));
@@ -778,10 +860,15 @@ public final class BrowseCraftClient implements ClientModInitializer {
             throw new IllegalArgumentException("placements must contain at least one block");
         }
 
+        List<AbsolutePlacement> effectivePlacements = absolutePlacements;
+        if (overlayState.hasPlan()) {
+            effectivePlacements = mergeWithExistingOverlay(absolutePlacements);
+        }
+
         int anchorX = Integer.MAX_VALUE;
         int anchorY = Integer.MAX_VALUE;
         int anchorZ = Integer.MAX_VALUE;
-        for (AbsolutePlacement placement : absolutePlacements) {
+        for (AbsolutePlacement placement : effectivePlacements) {
             anchorX = Math.min(anchorX, placement.x());
             anchorY = Math.min(anchorY, placement.y());
             anchorZ = Math.min(anchorZ, placement.z());
@@ -796,8 +883,8 @@ public final class BrowseCraftClient implements ClientModInitializer {
         }
         hasUndoState = true;
 
-        List<BuildPlacement> relativePlacements = new ArrayList<>(absolutePlacements.size());
-        for (AbsolutePlacement placement : absolutePlacements) {
+        List<BuildPlacement> relativePlacements = new ArrayList<>(effectivePlacements.size());
+        for (AbsolutePlacement placement : effectivePlacements) {
             relativePlacements.add(new BuildPlacement(
                     placement.x() - anchorX,
                     placement.y() - anchorY,
@@ -812,12 +899,31 @@ public final class BrowseCraftClient implements ClientModInitializer {
         overlayState.setPlan(plan);
         overlayState.setAnchor(anchor);
         overlayState.confirm();
+        overlayPlacementRevision++;
 
         JsonObject result = new JsonObject();
         result.addProperty("placed_count", relativePlacements.size());
         result.add("anchor", blockPosToJson(anchor));
         result.add("overlay", activeOverlaySummary(overlayState.snapshot()));
         return result;
+    }
+
+    private List<AbsolutePlacement> mergeWithExistingOverlay(List<AbsolutePlacement> incomingPlacements) {
+        OverlaySnapshot snapshot = overlayState.snapshot();
+        Map<BlockPos, String> mergedByPos = new LinkedHashMap<>();
+        for (OverlayState.TransformedPlacement transformed : snapshot.transformedPlacements()) {
+            mergedByPos.put(transformed.pos(), transformed.blockId());
+        }
+        for (AbsolutePlacement placement : incomingPlacements) {
+            mergedByPos.put(new BlockPos(placement.x(), placement.y(), placement.z()), placement.blockId());
+        }
+
+        List<AbsolutePlacement> merged = new ArrayList<>(mergedByPos.size());
+        for (Map.Entry<BlockPos, String> entry : mergedByPos.entrySet()) {
+            BlockPos pos = entry.getKey();
+            merged.add(new AbsolutePlacement(pos.getX(), pos.getY(), pos.getZ(), entry.getValue()));
+        }
+        return merged;
     }
 
     private JsonObject toolUndoLast() {
@@ -1012,6 +1118,97 @@ public final class BrowseCraftClient implements ClientModInitializer {
             return;
         }
         instance.runBuildTestCommand(MinecraftClient.getInstance());
+    }
+
+    public static void onChatBuildTestCommand(String message) {
+        if (instance == null) {
+            return;
+        }
+        instance.runChatBuildTestCommand(MinecraftClient.getInstance(), message, true);
+    }
+
+    public static void onChatBuildTestCommand(String message, boolean resetOverlay) {
+        if (instance == null) {
+            return;
+        }
+        instance.runChatBuildTestCommand(MinecraftClient.getInstance(), message, resetOverlay);
+    }
+
+    private void resetBuildTestToolTrace() {
+        synchronized (buildTestToolCalls) {
+            buildTestToolCalls.clear();
+        }
+        toolCallSequence = 0;
+    }
+
+    private void recordBuildTestToolCall(String tool, JsonObject params, JsonObject result) {
+        JsonObject entry = new JsonObject();
+        entry.addProperty("seq", ++toolCallSequence);
+        entry.addProperty("tool", tool);
+        if (params != null) {
+            entry.add("params", summarizeToolParams(tool, params));
+        }
+        if (result != null) {
+            entry.add("result", summarizeToolResult(tool, result));
+        }
+        synchronized (buildTestToolCalls) {
+            buildTestToolCalls.add(entry);
+        }
+    }
+
+    private JsonObject summarizeToolParams(String tool, JsonObject params) {
+        JsonObject summary = new JsonObject();
+        switch (tool) {
+            case "place_blocks" -> {
+                JsonElement placements = params.get("placements");
+                int count = placements != null && placements.isJsonArray() ? placements.getAsJsonArray().size() : 0;
+                summary.addProperty("placements_count", count);
+            }
+            case "inspect_area" -> {
+                if (params.has("radius")) {
+                    summary.addProperty("radius", params.get("radius").getAsInt());
+                }
+                if (params.has("detailed")) {
+                    summary.addProperty("detailed", params.get("detailed").getAsBoolean());
+                }
+            }
+            case "fill_region" -> {
+                if (params.has("from_corner")) {
+                    summary.add("from_corner", params.get("from_corner").getAsJsonObject().deepCopy());
+                }
+                if (params.has("to_corner")) {
+                    summary.add("to_corner", params.get("to_corner").getAsJsonObject().deepCopy());
+                }
+                if (params.has("block_id")) {
+                    summary.addProperty("block_id", params.get("block_id").getAsString());
+                }
+            }
+            default -> summary = params.deepCopy();
+        }
+        return summary;
+    }
+
+    private JsonObject summarizeToolResult(String tool, JsonObject result) {
+        JsonObject summary = new JsonObject();
+        if ("place_blocks".equals(tool) || "fill_region".equals(tool)) {
+            if (result.has("placed_count")) {
+                summary.addProperty("placed_count", result.get("placed_count").getAsInt());
+            }
+            if (result.has("anchor")) {
+                summary.add("anchor", result.get("anchor").getAsJsonObject().deepCopy());
+            }
+            return summary;
+        }
+        if ("inspect_area".equals(tool)) {
+            if (result.has("sampled_blocks")) {
+                summary.addProperty("sampled_blocks", result.get("sampled_blocks").getAsInt());
+            }
+            if (result.has("radius")) {
+                summary.addProperty("radius", result.get("radius").getAsInt());
+            }
+            return summary;
+        }
+        return result.deepCopy();
     }
 
     public static Path latestBuildTestJsonPath() {

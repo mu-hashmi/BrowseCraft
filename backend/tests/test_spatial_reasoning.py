@@ -363,3 +363,71 @@ def test_adds_roof_to_open_room(_configured_settings: None) -> None:
     for x in range(-2, 3):
         for z in range(-2, 3):
             assert world.block_at((x, 67, z)) == "minecraft:oak_planks"
+
+
+def test_multi_turn_room_modify_sequence_single_session(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+
+    app = create_app()
+    client_id = "spatial-multiturn-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message=(
+                    "Build a 5x5 minecraft:stone room centered on me with 3-block-high walls, "
+                    "hollow interior, and no roof."
+                ),
+            )
+
+            wall_positions: list[tuple[int, int, int]] = []
+            for x in range(-2, 3):
+                for y in range(64, 67):
+                    for z in range(-2, 3):
+                        if x in {-2, 2} or z in {-2, 2}:
+                            wall_positions.append((x, y, z))
+            assert all(world.block_at(pos) == "minecraft:stone" for pos in wall_positions)
+
+            interior_positions = [(x, y, z) for x in range(-1, 2) for y in range(64, 67) for z in range(-1, 2)]
+            assert all(world.block_at(pos) == "minecraft:air" for pos in interior_positions)
+
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message="Add a door on the south wall at ground level.",
+            )
+
+            door_positions = {(0, 64, 2), (0, 65, 2)}
+            assert any(world.block_at(position).endswith("_door") for position in door_positions)
+            for position in wall_positions:
+                if position in door_positions:
+                    continue
+                assert world.block_at(position) in {"minecraft:stone", "minecraft:oak_door"}
+
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message="Replace all minecraft:stone in that room with minecraft:birch_planks and keep the same shape.",
+            )
+
+    for x in range(-2, 3):
+        for y in range(64, 67):
+            for z in range(-2, 3):
+                is_wall = x in {-2, 2} or z in {-2, 2}
+                if not is_wall:
+                    assert world.block_at((x, y, z)) == "minecraft:air"
+                    continue
+
+                block_id = world.block_at((x, y, z))
+                if (x, y, z) in {(0, 64, 2), (0, 65, 2)} and block_id.endswith("_door"):
+                    continue
+                assert block_id == "minecraft:birch_planks"
