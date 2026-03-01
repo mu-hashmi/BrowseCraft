@@ -143,6 +143,75 @@ class BuildCommandControllerTest {
         assertEquals("plan a tower", backend.lastChatMessage);
     }
 
+    @Test
+    void searchCommandRoutesToBackend() {
+        FakeBackend backend = new FakeBackend();
+        BuildCommandController controller = new BuildCommandController(
+                "client-search",
+                backend,
+                new OverlayState(),
+                directExecutor(),
+                directExecutor(),
+                message -> {
+                },
+                () -> "world-search",
+                NO_OP_CHAT_EVENTS
+        );
+
+        controller.submitSearch("medieval castle");
+
+        assertEquals("client-search", backend.lastSearchClientId);
+        assertEquals("medieval castle", backend.lastSearchQuery);
+    }
+
+    @Test
+    void imagineCommandRoutesToBackend() {
+        FakeBackend backend = new FakeBackend();
+        BuildCommandController controller = new BuildCommandController(
+                "client-imagine",
+                backend,
+                new OverlayState(),
+                directExecutor(),
+                directExecutor(),
+                message -> {
+                },
+                () -> "world-imagine",
+                NO_OP_CHAT_EVENTS
+        );
+
+        controller.submitImagine("dragon statue");
+
+        assertEquals("client-imagine", backend.lastImagineClientId);
+        assertEquals("dragon statue", backend.lastImaginePrompt);
+    }
+
+    @Test
+    void backendStatusStagesReachChatEventListener() {
+        FakeBackend backend = new FakeBackend();
+        RecordingChatEvents chatEvents = new RecordingChatEvents();
+        List<String> statuses = new ArrayList<>();
+        BuildCommandController controller = new BuildCommandController(
+                "client-events",
+                backend,
+                new OverlayState(),
+                directExecutor(),
+                directExecutor(),
+                statuses::add,
+                () -> "world-events",
+                chatEvents
+        );
+
+        controller.onStatus("", "chat.delta", "stream ");
+        controller.onStatus("", "chat.response", "final");
+        controller.onStatus("", "tool_status", "🔍 Inspecting area...");
+
+        assertEquals(List.of("stream "), chatEvents.assistantDeltas);
+        assertEquals(List.of("final"), chatEvents.assistantMessages);
+        assertEquals(List.of("🔍 Inspecting area..."), chatEvents.toolStatuses);
+        assertTrue(statuses.contains("chat: final"));
+        assertTrue(statuses.contains("🔍 Inspecting area..."));
+    }
+
     private Executor directExecutor() {
         return Runnable::run;
     }
@@ -160,6 +229,10 @@ class BuildCommandControllerTest {
         private String lastSwitchClientId;
         private String lastSwitchWorldId;
         private String lastSwitchedSessionId;
+        private String lastSearchClientId;
+        private String lastSearchQuery;
+        private String lastImagineClientId;
+        private String lastImaginePrompt;
 
         @Override
         public void connect(BuildBackendListener listener) {
@@ -196,14 +269,45 @@ class BuildCommandControllerTest {
 
         @Override
         public void submitSearch(String clientId, String query) {
+            this.lastSearchClientId = clientId;
+            this.lastSearchQuery = query;
         }
 
         @Override
         public void submitImagine(String clientId, String prompt) {
+            this.lastImagineClientId = clientId;
+            this.lastImaginePrompt = prompt;
         }
 
         @Override
         public void close() {
+        }
+    }
+
+    private static final class RecordingChatEvents implements BuildCommandController.ChatEventListener {
+        private final List<String> userMessages = new ArrayList<>();
+        private final List<String> assistantDeltas = new ArrayList<>();
+        private final List<String> assistantMessages = new ArrayList<>();
+        private final List<String> toolStatuses = new ArrayList<>();
+
+        @Override
+        public void onUserMessage(String message) {
+            userMessages.add(message);
+        }
+
+        @Override
+        public void onAssistantDelta(String delta) {
+            assistantDeltas.add(delta);
+        }
+
+        @Override
+        public void onAssistantMessage(String message) {
+            assistantMessages.add(message);
+        }
+
+        @Override
+        public void onToolStatus(String status) {
+            toolStatuses.add(status);
         }
     }
 }

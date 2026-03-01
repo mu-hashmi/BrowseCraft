@@ -96,14 +96,17 @@ def _run_chat_round_trip(
     world: HeadlessVoxelWorld,
     client_id: str,
     message: str,
+    mode: str = "build",
     max_events: int = 600,
     tool_requests: list[str] | None = None,
+    tool_request_payloads: list[tuple[str, dict[str, Any]]] | None = None,
 ) -> str:
     response = client.post(
         "/v1/chat",
         json={
             "client_id": client_id,
             "message": message,
+            "mode": mode,
         },
     )
     response.raise_for_status()
@@ -119,6 +122,8 @@ def _run_chat_round_trip(
             params = envelope.get("params", {})
             if tool_requests is not None:
                 tool_requests.append(str(tool))
+            if tool_request_payloads is not None:
+                tool_request_payloads.append((str(tool), params))
             try:
                 result = _dispatch_tool(world, tool, params)
                 websocket.send_json(
@@ -631,3 +636,35 @@ def test_undo_then_rebuild_uses_undo_last(_configured_settings: None) -> None:
     assert all(block_id != "minecraft:stone" for block_id in final_changed.values())
     assert_height_profile(birch_coords, 64, 64)
     assert_footprint_matches(birch_coords, {(x, 0) for x in range(-2, 3)})
+
+
+@pytest.mark.quick_spatial
+def test_plan_mode_uses_set_plan_for_3x3_stone_platform(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+
+    app = create_app()
+    client_id = "spatial-plan-mode-client"
+    captured_tool_payloads: list[tuple[str, dict[str, Any]]] = []
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                mode="plan",
+                message="plan a 3x3 stone platform",
+                tool_request_payloads=captured_tool_payloads,
+            )
+
+    tool_names = [name for name, _ in captured_tool_payloads]
+    assert "set_plan" in tool_names
+    assert "place_blocks" not in tool_names
+    assert "fill_region" not in tool_names
+
+    set_plan_params = next(params for name, params in captured_tool_payloads if name == "set_plan")
+    placements = set_plan_params["placements"]
+    assert len(placements) == 9
+    assert all(placement["block_id"] == "minecraft:stone" for placement in placements)

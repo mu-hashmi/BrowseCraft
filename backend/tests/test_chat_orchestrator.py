@@ -9,8 +9,9 @@ from typing import Any
 
 import pytest
 
-from browsecraft_backend.chat_orchestrator import CHAT_MODEL, ChatOrchestrator
+from browsecraft_backend.chat_orchestrator import CHAT_MODEL, ChatOrchestrator, _tool_status_message
 from browsecraft_backend.convex_client import ConvexHttpClient
+from browsecraft_backend.models import ChatRequest
 from browsecraft_backend.supermemory_client import SupermemoryProfileContext, SupermemorySearchResult
 
 
@@ -41,6 +42,10 @@ class FakeAnthropicMessages:
             raise AssertionError("Unexpected anthropic stream call")
         response = self._responses.pop(0)
         return _FakeAnthropicStreamManager(response)
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls.append(copy.deepcopy(kwargs))
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text="")])
 
 
 class FakeAnthropicClient:
@@ -736,3 +741,80 @@ async def test_streaming_delta_events_are_sent_over_websocket() -> None:
     assert deltas[-1]["payload"]["partial"] == "Streaming test response."
     chat_responses = _messages_of_type(ws, "chat.response")
     assert chat_responses[0]["payload"]["message"] == "Streaming test response."
+
+
+def test_tool_status_message_formats_expected_strings() -> None:
+    assert _tool_status_message("inspect_area", {"radius": 6}) == "🔍 Inspecting area (r=6)..."
+    assert _tool_status_message("inspect_area", {}) == "🔍 Inspecting area..."
+    assert _tool_status_message(
+        "place_blocks",
+        {"placements": [{"x": 0, "y": 64, "z": 0, "block_id": "minecraft:stone"}]},
+    ) == "🔨 Placing 1 blocks..."
+    assert _tool_status_message("fill_region", {}) == "🧱 Filling region..."
+    assert _tool_status_message(
+        "set_plan",
+        {"placements": [{"dx": 0, "dy": 0, "dz": 0, "block_id": "minecraft:stone"}]},
+    ) == "📐 Loading plan (1 blocks)..."
+    assert _tool_status_message("player_position", {}) == "📍 Checking player position..."
+    assert _tool_status_message("undo_last", {}) == "↩ Undoing last change..."
+
+
+@pytest.mark.asyncio
+async def test_player_position_tool_use_is_served_from_cached_request_position() -> None:
+    anthropic_client = FakeAnthropicClient(
+        responses=[
+            _tool_use_response("player_position", {}),
+            _text_response("Position confirmed."),
+        ]
+    )
+    ws = FakeWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    await orchestrator._run_chat(chat_id="chat-position", client_id="client-position", user_message="where am i")
+
+    assert ws.tool_requests == [("client-position", "player_position", {})]
+    second_call = anthropic_client.messages.calls[1]
+    tool_result = second_call["messages"][-1]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert '"block_x": 10' in tool_result["content"]
+
+
+@pytest.mark.asyncio
+async def test_submit_chat_mode_plan_propagates_to_system_prompt() -> None:
+    anthropic_client = FakeAnthropicClient(responses=[_text_response("Planned.")])
+    ws = FakeWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    accepted = await orchestrator.submit_chat(
+        ChatRequest(client_id="client-mode", message="plan a tower", mode="plan")
+    )
+    await asyncio.gather(*list(orchestrator._tasks))
+
+    assert accepted.status == "accepted"
+    first_call = anthropic_client.messages.calls[0]
+    assert "Request mode for this turn: PLAN." in first_call["system"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_warmup_prompt_cache_is_idempotent() -> None:
+    anthropic_client = FakeAnthropicClient(responses=[])
+    ws = FakeWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    await orchestrator.warmup_prompt_cache()
+    await orchestrator.warmup_prompt_cache()
+
+    assert len(anthropic_client.messages.calls) == 1
+    assert anthropic_client.messages.calls[0]["max_tokens"] == 1
