@@ -34,11 +34,11 @@ _SYSTEM_PROMPT = (
     "You are BrowseCraft's Minecraft in-game assistant.\n"
     "Keep responses concise and action-oriented.\n"
     "Minecraft coordinates: +x=east, -x=west, +y=up, -y=down, +z=south, -z=north.\n"
-    "The live player_position is already injected in the system prompt. "
-    "Do not call player_position unless you suspect the player moved during this request.\n"
+    "A locked player_position snapshot captured when the user sent this request is already injected in the system prompt. "
+    "Do not call player_position to refresh it during this request.\n"
     "Use the injected build_anchor as the default center for new structures (10 blocks in front of player facing). "
     "For follow-up edits to an existing build (replace/add/extend/modify), inspect and anchor to that structure's "
-    "actual coordinates rather than re-centering on the player's latest position.\n"
+    "actual coordinates rather than re-centering on the player's locked snapshot.\n"
     "Do not assume default world heights like y=64.\n"
     "Treat block_x/block_y/block_z from player_position as context only when no existing target structure "
     "has been identified and the user did not provide explicit absolute coordinates.\n"
@@ -396,6 +396,15 @@ class ChatOrchestrator:
             world_id=world_id,
             requested_session_id=request.session_id,
         )
+        locked_player_position: _PlayerPositionResult | None = None
+        try:
+            locked_player_position = await self._require_player_position(client_id=request.client_id)
+        except Exception:
+            logger.warning(
+                "Unable to lock player position at chat submit time for client=%s",
+                request.client_id,
+                exc_info=True,
+            )
 
         chat_id = str(uuid4())
         task = asyncio.create_task(
@@ -406,6 +415,7 @@ class ChatOrchestrator:
                 request_mode=request.mode,
                 world_id=world_id,
                 session_id=session_id,
+                locked_player_position=locked_player_position,
             )
         )
         self._tasks.add(task)
@@ -439,7 +449,7 @@ class ChatOrchestrator:
                             "text": (
                                 f"{_SYSTEM_PROMPT}\n"
                                 "Request mode for this turn: BUILD.\n"
-                                "Live player position for this request (authoritative):\n"
+                                "Locked player position for this request (captured at submit time, authoritative):\n"
                                 "- x=0.000, y=64.000, z=0.000\n"
                                 "- block_x=0, block_y=64, block_z=0\n"
                                 "- facing=south, dimension=minecraft:overworld\n"
@@ -517,9 +527,12 @@ class ChatOrchestrator:
         *,
         world_id: str | None = None,
         session_id: str | None = None,
+        locked_player_position: _PlayerPositionResult | None = None,
     ) -> None:
         resolved_world_id = world_id or _DEFAULT_WORLD_ID
         try:
+            if locked_player_position is None:
+                locked_player_position = await self._require_player_position(client_id=client_id)
             resolved_session_id = session_id or await self._resolve_session_for_chat(
                 client_id=client_id,
                 world_id=resolved_world_id,
@@ -532,6 +545,7 @@ class ChatOrchestrator:
                 session_id=resolved_session_id,
                 user_message=user_message,
                 request_mode=request_mode,
+                player_position=locked_player_position,
             )
             await self._append_history(
                 world_id=resolved_world_id,
@@ -563,6 +577,7 @@ class ChatOrchestrator:
         session_id: str,
         user_message: str,
         request_mode: Literal["build", "plan", "plan_fast"],
+        player_position: _PlayerPositionResult,
     ) -> str:
         if not self._anthropic_api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is required for chat orchestrator")
@@ -575,7 +590,6 @@ class ChatOrchestrator:
             world_id=world_id,
             user_message=user_message,
         )
-        player_position = await self._require_player_position(client_id=client_id)
         build_anchor = _forward_build_anchor(
             player_position=player_position,
             distance=_DEFAULT_FORWARD_BUILD_OFFSET,
@@ -583,7 +597,7 @@ class ChatOrchestrator:
         system_prompt = (
             f"{_SYSTEM_PROMPT}\n"
             f"Request mode for this turn: {request_mode.upper()}.\n"
-            "Live player position for this request (authoritative):\n"
+            "Locked player position for this request (captured at submit time, authoritative):\n"
             f"- x={player_position.x:.3f}, y={player_position.y:.3f}, z={player_position.z:.3f}\n"
             f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
             f"- facing={player_position.facing}, dimension={player_position.dimension}\n"
@@ -1265,7 +1279,7 @@ def _validate_placement_against_player_position(
     if max_y < player_y - _MAX_Y_DELTA_FROM_PLAYER or min_y > player_y + _MAX_Y_DELTA_FROM_PLAYER:
         raise ValueError(
             f"{tool_name} y-range {min_y}..{max_y} is detached from current player block_y {player_y}; "
-            "derive placement coordinates from the live player_position for this request"
+            "derive placement coordinates from the locked player_position for this request"
         )
 
 

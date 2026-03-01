@@ -11,9 +11,8 @@ import nbtlib
 import pytest
 
 import browsecraft_backend.demo_pipelines as demo_pipelines
-from browsecraft_backend.demo_pipelines import DemoPipelines, _best_candidate
+from browsecraft_backend.demo_pipelines import DemoPipelines, _absolute_placements, _best_candidate
 from browsecraft_backend.models import ImagineRequest, SearchRequest
-from browser_use_sdk._core.errors import BrowserUseError
 
 
 class FakeWebSocketManager:
@@ -24,8 +23,24 @@ class FakeWebSocketManager:
     async def send_payload(self, client_id: str, payload: dict[str, Any]) -> None:
         self.sent_payloads.append((client_id, payload))
 
-    async def request_tool(self, client_id: str, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def request_tool(
+        self,
+        client_id: str,
+        tool_name: str,
+        params: dict[str, Any],
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        assert timeout > 0
         self.tool_requests.append((client_id, tool_name, params))
+        if tool_name == "player_position":
+            return {
+                "block_x": 10,
+                "block_y": 64,
+                "block_z": 20,
+                "facing": "north",
+            }
+        if tool_name == "place_blocks":
+            return {"placed_count": len(params["placements"])}
         return {"ok": True}
 
 
@@ -99,6 +114,54 @@ def test_best_candidate_returns_none_for_none_or_empty_or_string() -> None:
     assert _best_candidate(None) is None
     assert _best_candidate("raw output") is None
     assert _best_candidate(demo_pipelines._SearchCandidates(candidates=[])) is None
+
+
+def test_best_candidate_uses_task_output_url_override_for_broken_download_url() -> None:
+    output = demo_pipelines._SearchCandidates(
+        candidates=[
+            demo_pipelines._SearchCandidate(
+                canonical_url="https://example.com/a",
+                filename="castle.schem",
+                title="Castle",
+                score=0.95,
+                download_url="https://www.planetminecraft.com/download/worldmap/castle/",
+            ),
+            demo_pipelines._SearchCandidate(
+                canonical_url="https://example.com/b",
+                filename="backup.schem",
+                title="Backup",
+                score=0.50,
+                download_url="https://downloads.example/backup.schem",
+            ),
+        ]
+    )
+
+    selected = _best_candidate(
+        output,
+        {"castle.schem": "https://downloads.example/castle.schem"},
+    )
+    assert selected is not None
+    assert selected.title == "Castle"
+    assert selected.download_url == "https://downloads.example/castle.schem"
+
+
+def test_absolute_placements_anchor_ten_blocks_in_front_of_search_position() -> None:
+    placements = [
+        {"dx": 0, "dy": 0, "dz": 0, "block_id": "minecraft:stone"},
+        {"dx": 2, "dy": 1, "dz": 0, "block_id": "minecraft:dirt"},
+    ]
+    absolute = _absolute_placements(
+        relative_placements=placements,
+        player_position={
+            "block_x": 100,
+            "block_y": 64,
+            "block_z": 200,
+            "facing": "north",
+        },
+    )
+
+    assert absolute[0] == {"x": 100, "y": 64, "z": 190, "block_id": "minecraft:stone"}
+    assert absolute[1] == {"x": 102, "y": 65, "z": 190, "block_id": "minecraft:dirt"}
 
 
 @pytest.mark.asyncio
@@ -234,7 +297,18 @@ async def test_search_pipeline_emits_expected_status_sequence(
             return SimpleNamespace(files=[])
 
         def run(self, **kwargs: Any) -> FakeTaskRun:
-            assert set(kwargs.keys()) == {"task", "output_schema"}
+            assert set(kwargs.keys()) == {
+                "task",
+                "output_schema",
+                "llm",
+                "start_url",
+                "max_steps",
+                "allowed_domains",
+                "flash_mode",
+                "thinking",
+                "vision",
+                "system_prompt_extension",
+            }
             assert kwargs["output_schema"] == demo_pipelines._SearchCandidates
             assert "Use Planet Minecraft only." in kwargs["task"]
             assert "Never return /download/worldmap/" in kwargs["task"]
@@ -243,7 +317,7 @@ async def test_search_pipeline_emits_expected_status_sequence(
         async def close(self) -> None:
             return None
 
-    monkeypatch.setattr(demo_pipelines, "AsyncBrowserUseV3", FakeBrowserUse)
+    monkeypatch.setattr(demo_pipelines, "AsyncBrowserUseV2", FakeBrowserUse)
     monkeypatch.setattr(demo_pipelines.httpx, "AsyncClient", FakeHttpClient)
 
     pipelines = DemoPipelines(
@@ -262,23 +336,27 @@ async def test_search_pipeline_emits_expected_status_sequence(
         "🔎 Searching Planet Minecraft...",
         "✅ Found: Medieval Castle",
         "📥 Downloading schematic...",
-        "📐 Loaded 4 blocks into preview",
+        "🧭 Using /search position (10 blocks ahead)...",
+        "🧱 Placing blocks 1/1...",
         "✓ Done",
     ]
-    assert ws.tool_requests
-    tool_name = ws.tool_requests[0][1]
-    params = ws.tool_requests[0][2]
-    assert tool_name == "set_plan"
+    assert len(ws.tool_requests) == 2
+    assert ws.tool_requests[0][1] == "player_position"
+    assert ws.tool_requests[0][2] == {}
+    assert ws.tool_requests[1][1] == "place_blocks"
+    params = ws.tool_requests[1][2]
     assert len(params["placements"]) == 4
+    response_messages = [payload["payload"]["message"] for _, payload in ws.sent_payloads if payload.get("type") == "chat.response"]
+    assert response_messages[-1] == "Built 4 blocks from Medieval Castle."
 
 
 @pytest.mark.asyncio
-async def test_search_pipeline_falls_back_to_v2_on_v3_sandbox_error(
+async def test_search_pipeline_uses_v2_runtime_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     schem_bytes = _minimal_schem_bytes()
     ws = FakeWebSocketManager()
-    fallback_hit = False
+    v2_hit = False
 
     class FakeHttpResponse:
         def __init__(self, content: bytes) -> None:
@@ -301,18 +379,6 @@ async def test_search_pipeline_falls_back_to_v2_on_v3_sandbox_error(
             assert url == "https://downloads.example/castle-v2.schem"
             return FakeHttpResponse(schem_bytes)
 
-    class FakeV3BrowserUse:
-        def __init__(self, api_key: str, timeout: float) -> None:
-            assert api_key == "test-browser-key"
-            self.api_key = api_key
-            self.timeout = timeout
-
-        async def run(self, **_: Any) -> None:
-            raise BrowserUseError(500, "Failed to start agent sandbox")
-
-        async def close(self) -> None:
-            return None
-
     class FakeV2BrowserUse:
         def __init__(self, api_key: str, timeout: float) -> None:
             assert api_key == "test-browser-key"
@@ -331,8 +397,8 @@ async def test_search_pipeline_falls_back_to_v2_on_v3_sandbox_error(
                 "vision",
                 "system_prompt_extension",
             }
-            nonlocal fallback_hit
-            fallback_hit = True
+            nonlocal v2_hit
+            v2_hit = True
 
             task = SimpleNamespace(
                 id="task-1",
@@ -359,7 +425,6 @@ async def test_search_pipeline_falls_back_to_v2_on_v3_sandbox_error(
         async def close(self) -> None:
             return None
 
-    monkeypatch.setattr(demo_pipelines, "AsyncBrowserUseV3", FakeV3BrowserUse)
     monkeypatch.setattr(demo_pipelines, "AsyncBrowserUseV2", FakeV2BrowserUse)
     monkeypatch.setattr(demo_pipelines.httpx, "AsyncClient", FakeHttpClient)
 
@@ -374,13 +439,13 @@ async def test_search_pipeline_falls_back_to_v2_on_v3_sandbox_error(
     await pipelines.submit_search(SearchRequest(client_id="client-5", query="medieval castle schematic"))
     await _drain_tasks(pipelines)
 
-    assert fallback_hit
+    assert v2_hit
     statuses = _statuses(ws)
     assert statuses == [
         "🔎 Searching Planet Minecraft...",
-        "⚠️ Browser-Use v3 unavailable, retrying with v2 runtime.",
         "✅ Found: Medieval Castle v2",
         "📥 Downloading schematic...",
-        "📐 Loaded 4 blocks into preview",
+        "🧭 Using /search position (10 blocks ahead)...",
+        "🧱 Placing blocks 1/1...",
         "✓ Done",
     ]

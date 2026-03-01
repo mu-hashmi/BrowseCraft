@@ -217,6 +217,32 @@ class DelayedWebSocketManager(FakeWebSocketManager):
         return {"tool": tool_name, "ok": True}
 
 
+class MutablePositionWebSocketManager(FakeWebSocketManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_x = 10
+        self.block_y = 64
+        self.block_z = 20
+        self.facing = "south"
+
+    async def request_tool(self, client_id: str, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.tool_requests.append((client_id, tool_name, params))
+        if tool_name == "player_position":
+            return {
+                "x": self.block_x + 0.5,
+                "y": float(self.block_y),
+                "z": self.block_z + 0.5,
+                "yaw": 0.0,
+                "pitch": 0.0,
+                "block_x": self.block_x,
+                "block_y": self.block_y,
+                "block_z": self.block_z,
+                "facing": self.facing,
+                "dimension": "minecraft:overworld",
+            }
+        return {"tool": tool_name, "ok": True}
+
+
 class FakeConvexClient(ConvexHttpClient):
     def __init__(self) -> None:
         self.sessions_by_world: dict[str, dict[str, dict[str, Any]]] = {}
@@ -377,7 +403,7 @@ async def test_place_blocks_tool_routes_through_websocket_manager_and_emits_chat
     assert first_call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
     assert first_call["tool_choice"] == {"type": "any"}
     assert {tool["name"] for tool in first_call["tools"]} == EXPECTED_TOOL_NAMES
-    assert "Live player position for this request (authoritative)" in first_call["system"][0]["text"]
+    assert "Locked player position for this request (captured at submit time, authoritative)" in first_call["system"][0]["text"]
     assert "block_x=10, block_y=64, block_z=20" in first_call["system"][0]["text"]
     assert "build_anchor_x=10, build_anchor_y=64, build_anchor_z=30" in first_call["system"][0]["text"]
 
@@ -1024,6 +1050,33 @@ async def test_submit_chat_mode_plan_propagates_to_system_prompt() -> None:
     first_call = anthropic_client.messages.calls[0]
     assert first_call["tool_choice"] == {"type": "any"}
     assert "Request mode for this turn: PLAN." in first_call["system"][0]["text"]
+    assert "build_anchor_x=10, build_anchor_y=64, build_anchor_z=30" in first_call["system"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_submit_chat_locks_player_position_at_submit_time() -> None:
+    anthropic_client = FakeAnthropicClient(responses=[_text_response("Acknowledged.")])
+    ws = MutablePositionWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    accepted = await orchestrator.submit_chat(
+        ChatRequest(client_id="client-lock", message="where am i", mode="build")
+    )
+    ws.block_x = 99
+    ws.block_y = 70
+    ws.block_z = -20
+    ws.facing = "north"
+    await asyncio.gather(*list(orchestrator._tasks))
+
+    assert accepted.status == "accepted"
+    assert ws.tool_requests == [("client-lock", "player_position", {})]
+    first_call = anthropic_client.messages.calls[0]
+    assert "block_x=10, block_y=64, block_z=20" in first_call["system"][0]["text"]
+    assert "facing=south" in first_call["system"][0]["text"]
     assert "build_anchor_x=10, build_anchor_y=64, build_anchor_z=30" in first_call["system"][0]["text"]
 
 

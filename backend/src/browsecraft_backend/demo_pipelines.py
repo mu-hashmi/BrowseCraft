@@ -12,8 +12,6 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 from browser_use_sdk import AsyncBrowserUse as AsyncBrowserUseV2
-from browser_use_sdk.v3 import AsyncBrowserUse as AsyncBrowserUseV3
-from browser_use_sdk._core.errors import BrowserUseError
 from pydantic import BaseModel, Field
 
 from .models import AsyncJobAcceptedResponse, ChatAcceptedResponse, ChatRequest, ImagineRequest, SearchRequest
@@ -77,10 +75,20 @@ _PLANET_MINECRAFT_DOWNLOAD_HEADERS = {
 
 _V3_MODELS = ("bu-mini", "bu-max")
 _V2_FALLBACK_LLM = "browser-use-llm"
-
-
-# Keep this alias for tests that monkeypatch this symbol (v3 search path).
-AsyncBrowserUse = AsyncBrowserUseV3
+_PLACE_BLOCK_BATCH_SIZE = 256
+_SEARCH_FORWARD_BLOCKS = 10
+_FACING_TO_FORWARD_OFFSET = {
+    "north": (0, -1),
+    "east": (1, 0),
+    "south": (0, 1),
+    "west": (-1, 0),
+}
+_FACING_TO_ROTATION = {
+    "north": 0,
+    "east": 1,
+    "south": 2,
+    "west": 3,
+}
 
 
 def _filename_from_url(value: str | None) -> str:
@@ -89,28 +97,12 @@ def _filename_from_url(value: str | None) -> str:
     return unquote(urlsplit(value).path).rsplit("/", maxsplit=1)[-1]
 
 
-def _normalize_browser_use_model_v3(value: str | None) -> str | None:
-    if value is None:
-        return None
-    if value in _V3_MODELS:
-        return value
-
-    logger.warning("Unsupported browser-use model '%s'. Falling back to Browser-Use v3 default model.", value)
-    return None
-
-
 def _normalize_browser_use_model_v2(value: str | None) -> str:
     if value is None:
         return _V2_FALLBACK_LLM
     if value in _V3_MODELS:
         return _V2_FALLBACK_LLM
     return value
-
-
-def _should_fallback_to_v2(exc: Exception) -> bool:
-    if isinstance(exc, BrowserUseError):
-        return exc.status_code in (422, 500, 503)
-    return False
 
 
 def _is_broken_download_url(url: str | None) -> bool:
@@ -193,25 +185,29 @@ class DemoPipelines:
 
     async def _run_search(self, *, job_id: str, client_id: str, query: str) -> None:
         try:
+            search_origin = await self._websocket_manager.request_tool(
+                client_id=client_id,
+                tool_name="player_position",
+                params={},
+            )
             await self._emit_status(client_id, "🔎 Searching Planet Minecraft...")
             downloaded = await self._search_and_download(
                 query=query,
                 status_callback=lambda status: self._emit_status(client_id, status),
             )
             placements = parse_schematic(downloaded.path)
-            await self._emit_status(client_id, f"📐 Loaded {len(placements)} blocks into preview")
-            await self._websocket_manager.request_tool(
+            placed_count = await self._place_blocks_from_schematic(
                 client_id=client_id,
-                tool_name="set_plan",
-                params={"placements": placements},
+                placements=placements,
+                search_origin=search_origin,
+                status_callback=lambda status: self._emit_status(client_id, status),
             )
             await self._emit_status(client_id, "✓ Done")
             await self._emit_chat_response(
                 client_id=client_id,
                 job_id=job_id,
                 message=(
-                    f"Loaded plan preview from {downloaded.title} "
-                    f"({len(placements)} blocks). Walk to position and confirm."
+                    f"Built {placed_count} blocks from {downloaded.title}."
                 ),
             )
         except Exception as exc:
@@ -271,31 +267,6 @@ class DemoPipelines:
         if not self._browser_use_api_key:
             raise RuntimeError("BROWSER_USE_API_KEY is required for /search")
 
-        browser_v3 = AsyncBrowserUseV3(api_key=self._browser_use_api_key, timeout=300.0)
-        should_fallback_to_v2 = False
-        try:
-            result = await self._search_via_browser_use_v3(
-                browser=browser_v3,
-                query=query,
-            )
-            return await _finalize_download(
-                browser=browser_v3,
-                result=result,
-                status_callback=status_callback,
-            )
-        except BrowserUseError as exc:
-            if not _should_fallback_to_v2(exc):
-                raise
-            logger.warning(
-                "Search via Browser-Use v3 failed with %s (%s). Falling back to v2 runtime.",
-                exc.status_code,
-                exc,
-            )
-            await status_callback("⚠️ Browser-Use v3 unavailable, retrying with v2 runtime.")
-            should_fallback_to_v2 = True
-        finally:
-            await browser_v3.close()
-
         browser_v2 = AsyncBrowserUseV2(api_key=self._browser_use_api_key, timeout=300.0)
         try:
             result = await self._search_via_browser_use_v2(
@@ -309,47 +280,6 @@ class DemoPipelines:
             )
         finally:
             await browser_v2.close()
-
-    async def _search_via_browser_use_v3(
-        self,
-        *,
-        browser: AsyncBrowserUseV3,
-        query: str,
-    ) -> Any:
-        payload = {
-            "task": _build_search_task(query),
-            "output_schema": _SearchCandidates,
-        }
-
-        model = _normalize_browser_use_model_v3(self._browser_use_llm)
-        if model is not None:
-            payload["model"] = model
-            retry_payload = {"task": payload["task"], "output_schema": _SearchCandidates}
-            payloads = (payload, retry_payload)
-        else:
-            payloads = (payload,)
-
-        last_error: Exception | None = None
-        for search_payload in payloads:
-            try:
-                return await browser.run(**search_payload)
-            except BrowserUseError as exc:
-                if (
-                    model is not None
-                    and search_payload is payload
-                    and exc.status_code == 422
-                ):
-                    logger.warning(
-                        "Search via Browser-Use v3 rejected with %s (%s). Retrying with stripped payload.",
-                        exc.status_code,
-                        exc,
-                    )
-                    last_error = exc
-                    continue
-                last_error = exc
-                raise
-
-        raise RuntimeError(f"Browser-Use v3 search failed: {last_error}")
 
     async def _search_via_browser_use_v2(
         self,
@@ -373,6 +303,39 @@ class DemoPipelines:
             search_kwargs["skill_ids"] = [self._browser_use_skill_id]
         return await browser.run(**search_kwargs)
 
+    async def _place_blocks_from_schematic(
+        self,
+        *,
+        client_id: str,
+        placements: list[dict[str, Any]],
+        search_origin: dict[str, Any],
+        status_callback: Callable[[str], Awaitable[None]],
+    ) -> int:
+        if not placements:
+            raise RuntimeError("Parsed schematic did not contain placeable blocks")
+
+        await status_callback(f"🧭 Using /search position ({_SEARCH_FORWARD_BLOCKS} blocks ahead)...")
+        absolute_placements = _absolute_placements(
+            relative_placements=placements,
+            player_position=search_origin,
+        )
+
+        total_placements = len(absolute_placements)
+        batch_count = (total_placements + _PLACE_BLOCK_BATCH_SIZE - 1) // _PLACE_BLOCK_BATCH_SIZE
+        placed_count = 0
+        for batch_index in range(batch_count):
+            start = batch_index * _PLACE_BLOCK_BATCH_SIZE
+            end = min(total_placements, start + _PLACE_BLOCK_BATCH_SIZE)
+            await status_callback(f"🧱 Placing blocks {batch_index + 1}/{batch_count}...")
+            result = await self._websocket_manager.request_tool(
+                client_id=client_id,
+                tool_name="place_blocks",
+                params={"placements": absolute_placements[start:end]},
+                timeout=120.0,
+            )
+            placed_count += int(result["placed_count"])
+        return placed_count
+
 
 async def _finalize_download(
     *,
@@ -380,7 +343,8 @@ async def _finalize_download(
     result: Any,
     status_callback: Callable[[str], Awaitable[None]],
 ) -> _DownloadedSchematic:
-    candidates = _ordered_candidates(result.output)
+    task_output_urls = await _task_output_urls_by_filename(browser=browser, result=result)
+    candidates = _ordered_candidates(result.output, task_output_urls)
     if not candidates:
         raise RuntimeError("No schematic candidates found")
     await status_callback(f"✅ Found: {candidates[0].title}")
@@ -417,16 +381,22 @@ async def _finalize_download(
         )
 
 
-def _best_candidate(output: _SearchCandidates | str | None) -> _SearchCandidate | None:
+def _best_candidate(
+    output: _SearchCandidates | str | None,
+    task_output_urls: dict[str, str] | None = None,
+) -> _SearchCandidate | None:
     if output is None or isinstance(output, str):
         return None
-    if not output.candidates:
+    candidates = _ordered_candidates(output, task_output_urls)
+    if not candidates:
         return None
-    sorted_candidates = sorted(output.candidates, key=lambda item: item.score, reverse=True)
-    return next((candidate for candidate in sorted_candidates if _is_candidate_file(candidate)), None)
+    return candidates[0]
 
 
-def _ordered_candidates(output: _SearchCandidates | str | None) -> list[_SearchCandidate]:
+def _ordered_candidates(
+    output: _SearchCandidates | str | None,
+    task_output_urls: dict[str, str] | None = None,
+) -> list[_SearchCandidate]:
     if output is None or isinstance(output, str):
         return []
     if not output.candidates:
@@ -435,9 +405,82 @@ def _ordered_candidates(output: _SearchCandidates | str | None) -> list[_SearchC
     sorted_candidates = sorted(output.candidates, key=lambda item: item.score, reverse=True)
     result: list[_SearchCandidate] = []
     for candidate in sorted_candidates:
-        if _is_candidate_file(candidate):
-            result.append(candidate)
-    return result[:3]
+        candidate_with_download = _candidate_with_task_output_url(candidate, task_output_urls)
+        if not _is_candidate_file(candidate_with_download):
+            continue
+        result.append(candidate_with_download)
+    return _single_best_candidate(result)
+
+
+def _candidate_with_task_output_url(
+    candidate: _SearchCandidate,
+    task_output_urls: dict[str, str] | None,
+) -> _SearchCandidate:
+    if candidate.download_url and not _is_broken_download_url(candidate.download_url):
+        return candidate
+    if not task_output_urls:
+        return candidate
+    filename = _filename_from_candidate(candidate)
+    if not filename:
+        return candidate
+    download_url = task_output_urls.get(_normalize_filename(filename))
+    if download_url is None:
+        return candidate
+    return candidate.model_copy(update={"download_url": download_url})
+
+
+def _single_best_candidate(candidates: list[_SearchCandidate]) -> list[_SearchCandidate]:
+    if not candidates:
+        return []
+    best = max(candidates, key=lambda candidate: candidate.score)
+    return [best]
+
+
+async def _task_output_urls_by_filename(
+    *,
+    browser: Any,
+    result: Any,
+) -> dict[str, str]:
+    task = getattr(result, "task", None)
+    task_id = getattr(task, "id", None)
+    output_files = getattr(task, "output_files", None)
+    if task is None or task_id is None or output_files is None:
+        return {}
+    if not hasattr(browser, "files"):
+        return {}
+
+    urls: dict[str, str] = {}
+    for output_file in output_files:
+        file_name = _read_output_file_name(output_file)
+        if not file_name:
+            continue
+        file_url = _read_output_file_url(output_file)
+        if file_url is None:
+            file_id = getattr(output_file, "id", None)
+            if file_id is None:
+                continue
+            task_output = await browser.files.task_output(str(task_id), str(file_id))
+            file_url = _read_output_file_url(task_output)
+        if file_url is None:
+            continue
+        urls[_normalize_filename(file_name)] = file_url
+    return urls
+
+
+def _read_output_file_name(output_file: Any) -> str:
+    for key in ("file_name", "path", "name", "filename"):
+        value = getattr(output_file, key, None)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _read_output_file_url(output_file: Any) -> str | None:
+    for key in ("download_url", "url"):
+        value = getattr(output_file, key, None)
+        if isinstance(value, str):
+            return value
+    return None
 
 
 def _is_candidate_file(candidate: _SearchCandidate) -> bool:
@@ -603,3 +646,53 @@ def _filename_from_candidate(candidate: _SearchCandidate) -> str:
         if extracted:
             return extracted
     return _filename_from_url(candidate.download_url)
+
+
+def _normalize_filename(value: str) -> str:
+    return "".join(_filename_from_url(value).lower().split())
+
+
+def _absolute_placements(
+    *,
+    relative_placements: list[dict[str, Any]],
+    player_position: dict[str, Any],
+) -> list[dict[str, Any]]:
+    base_x = int(player_position["block_x"])
+    base_y = int(player_position["block_y"])
+    base_z = int(player_position["block_z"])
+    facing = str(player_position["facing"]).lower()
+
+    if facing not in _FACING_TO_FORWARD_OFFSET:
+        raise RuntimeError(f"Unsupported player facing: {facing}")
+
+    forward_x, forward_z = _FACING_TO_FORWARD_OFFSET[facing]
+    rotation = _FACING_TO_ROTATION[facing]
+    anchor_x = base_x + (forward_x * _SEARCH_FORWARD_BLOCKS)
+    anchor_z = base_z + (forward_z * _SEARCH_FORWARD_BLOCKS)
+
+    absolute: list[dict[str, Any]] = []
+    for placement in relative_placements:
+        dx = int(placement["dx"])
+        dy = int(placement["dy"])
+        dz = int(placement["dz"])
+        block_id = str(placement["block_id"])
+        rotated_x, rotated_z = _rotate(dx, dz, rotation)
+        absolute.append(
+            {
+                "x": anchor_x + rotated_x,
+                "y": base_y + dy,
+                "z": anchor_z + rotated_z,
+                "block_id": block_id,
+            }
+        )
+    return absolute
+
+
+def _rotate(x: int, z: int, rotation_quarters: int) -> tuple[int, int]:
+    if rotation_quarters == 1:
+        return -z, x
+    if rotation_quarters == 2:
+        return -x, -z
+    if rotation_quarters == 3:
+        return z, -x
+    return x, z

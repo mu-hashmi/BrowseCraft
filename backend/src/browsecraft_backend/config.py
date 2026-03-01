@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     anthropic_chat_model: str = "claude-sonnet-4-6"
     supermemory_api_key: str | None = None
     browser_use_api_key: str | None = None
-    browser_use_llm: str = "bu-mini"
+    browser_use_llm: str = "browser-use-llm"
     browser_use_planet_minecraft_skill_id: str | None = None
 
 
