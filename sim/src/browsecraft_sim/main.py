@@ -12,6 +12,8 @@ from typing import Any
 import httpx
 import websockets
 
+from .tool_dispatch import dispatch_tool
+
 
 Coord = tuple[int, int, int]
 _TERRAIN_BLOCK_IDS = {
@@ -313,7 +315,7 @@ async def _handle_tool_request(world: HeadlessVoxelWorld, websocket: Any, envelo
     params = envelope.get("params", {})
 
     try:
-        result = _dispatch_tool(world, tool, params)
+        result = dispatch_tool(world, tool, params)
         response = {
             "type": "tool.response",
             "request_id": request_id,
@@ -327,63 +329,6 @@ async def _handle_tool_request(world: HeadlessVoxelWorld, websocket: Any, envelo
         }
 
     await websocket.send(json.dumps(response))
-
-
-def _dispatch_tool(world: HeadlessVoxelWorld, tool: str, params: dict[str, Any]) -> dict[str, Any]:
-    if tool == "player_position":
-        return world.player_position()
-    if tool == "player_inventory":
-        return world.player_inventory()
-    if tool == "inspect_area":
-        return world.inspect_area(
-            center=params["center"],
-            radius=int(params["radius"]),
-            detailed=bool(params.get("detailed", False)),
-            filter_terrain=bool(params.get("filter_terrain", True)),
-        )
-    if tool == "place_blocks":
-        placements = params["placements"]
-        if not isinstance(placements, list):
-            raise RuntimeError("place_blocks expects placements list")
-        return world.place_blocks(placements)
-    if tool == "fill_region":
-        return world.fill_region(
-            from_corner=params["from_corner"],
-            to_corner=params["to_corner"],
-            block_id=str(params["block_id"]),
-        )
-    if tool == "undo_last":
-        return world.undo_last()
-    if tool == "get_active_overlay":
-        return {
-            "has_plan": False,
-            "block_count": 0,
-            "anchor": {"x": 0, "y": 0, "z": 0},
-            "rotation_quarter_turns": 0,
-            "preview_mode": False,
-            "confirmed": False,
-            "remaining_count": 0,
-        }
-    if tool == "modify_overlay":
-        return {"op": params.get("op")}
-    if tool == "get_blueprints":
-        return {"names": [], "count": 0}
-    if tool == "save_blueprint":
-        return {"name": params.get("name"), "saved": True}
-    if tool == "load_blueprint":
-        return {
-            "name": params.get("name"),
-            "overlay": {
-                "has_plan": False,
-                "block_count": 0,
-                "anchor": {"x": 0, "y": 0, "z": 0},
-                "rotation_quarter_turns": 0,
-                "preview_mode": False,
-                "confirmed": False,
-                "remaining_count": 0,
-            },
-        }
-    raise RuntimeError(f"Unsupported tool: {tool}")
 
 
 def _is_terrain_block(block_id: str, y: int) -> bool:

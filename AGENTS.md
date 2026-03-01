@@ -84,3 +84,12 @@ Then run `/chat <message>` in-game.
 - `Exceeded max tool rounds`: model is stuck in inspect/modify loop; tighten prompt guidance.
 - Spatial assertions failing with zero placements: model did not call `place_blocks`.
 - Spatial assertions failing due wrong coordinates: improve orientation/grounding instructions in the system prompt.
+
+## RL Workflow Notes
+
+- RL modules live under `sim/src/browsecraft_sim/rl`.
+- Shared simulator dispatch logic lives in `sim/src/browsecraft_sim/tool_dispatch.py`.
+- Use deterministic task generation through `sim/scripts/generate_hud_tasks.py`.
+- Keep reward settings configurable via JSON/CLI, defaulting to format-gated scoring.
+- Use Claude-only baseline models first (`claude-sonnet-4-6`, `claude-opus-4-6`) before adding provider adapters.
+- Run `backend` regression tests after dispatch changes before adding additional RL code.
