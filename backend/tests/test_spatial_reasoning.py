@@ -9,10 +9,11 @@ from fastapi.testclient import TestClient
 
 from browsecraft_backend.app import create_app
 from browsecraft_backend.config import get_settings
-from browsecraft_sim.main import HeadlessVoxelWorld, world_bounding_box
+from browsecraft_sim.main import HeadlessVoxelWorld, PlayerState, world_bounding_box
 
 
 pytestmark = pytest.mark.spatial
+Coord = tuple[int, int, int]
 
 
 def _dispatch_tool(world: HeadlessVoxelWorld, tool: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -80,6 +81,7 @@ def _run_chat_round_trip(
     client_id: str,
     message: str,
     max_events: int = 600,
+    tool_requests: list[str] | None = None,
 ) -> str:
     response = client.post(
         "/v1/chat",
@@ -99,6 +101,8 @@ def _run_chat_round_trip(
             request_id = envelope["request_id"]
             tool = envelope["tool"]
             params = envelope.get("params", {})
+            if tool_requests is not None:
+                tool_requests.append(str(tool))
             try:
                 result = _dispatch_tool(world, tool, params)
                 websocket.send_json(
@@ -125,15 +129,60 @@ def _run_chat_round_trip(
     raise TimeoutError("chat.response was not received before max_events")
 
 
-def _changed_blocks(before: dict[tuple[int, int, int], str], after: dict[tuple[int, int, int], str]) -> dict[tuple[int, int, int], str]:
-    keys = set(before) | set(after)
-    changed: dict[tuple[int, int, int], str] = {}
-    for coord in keys:
-        before_block = before.get(coord, "minecraft:air")
-        after_block = after.get(coord, "minecraft:air")
-        if before_block != after_block:
-            changed[coord] = after_block
-    return changed
+def assert_region_is(
+    world: HeadlessVoxelWorld,
+    x_range: range,
+    y_range: range,
+    z_range: range,
+    expected_block: str,
+) -> None:
+    for x in x_range:
+        for y in y_range:
+            for z in z_range:
+                actual = world.block_at((x, y, z))
+                assert actual == expected_block, f"at ({x},{y},{z}): expected {expected_block}, got {actual}"
+
+
+def assert_footprint_matches(coords: set[Coord], expected_footprint_set: set[tuple[int, int]]) -> None:
+    actual = {(x, z) for x, _, z in coords}
+    assert actual == expected_footprint_set
+
+
+def assert_height_profile(coords: set[Coord], expected_min_y: int, expected_max_y: int) -> None:
+    y_values = {coord[1] for coord in coords}
+    assert y_values
+    assert min(y_values) == expected_min_y
+    assert max(y_values) == expected_max_y
+
+
+def assert_is_hollow_box(
+    world: HeadlessVoxelWorld,
+    *,
+    min_corner: Coord,
+    max_corner: Coord,
+    shell_block: str,
+) -> None:
+    min_x, min_y, min_z = min_corner
+    max_x, max_y, max_z = max_corner
+    for x in range(min_x, max_x + 1):
+        for y in range(min_y, max_y + 1):
+            for z in range(min_z, max_z + 1):
+                is_shell = x in {min_x, max_x} or y in {min_y, max_y} or z in {min_z, max_z}
+                expected = shell_block if is_shell else "minecraft:air"
+                actual = world.block_at((x, y, z))
+                assert actual == expected, f"at ({x},{y},{z}): expected {expected}, got {actual}"
+
+
+def _forward_offset(facing: str) -> tuple[int, int]:
+    if facing == "north":
+        return (0, -1)
+    if facing == "south":
+        return (0, 1)
+    if facing == "east":
+        return (1, 0)
+    if facing == "west":
+        return (-1, 0)
+    raise ValueError(f"Unsupported facing: {facing}")
 
 
 def _is_connected(coords: set[tuple[int, int, int]]) -> bool:
@@ -175,10 +224,11 @@ def _configured_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     get_settings.cache_clear()
 
 
+@pytest.mark.quick_spatial
 def test_builds_3x3x3_stone_cube_near_player(_configured_settings: None) -> None:
     world = HeadlessVoxelWorld()
     world.flat_terrain(radius=24)
-    before = dict(world.blocks)
+    before = world.snapshot()
 
     app = create_app()
     client_id = "spatial-cube-client"
@@ -196,7 +246,7 @@ def test_builds_3x3x3_stone_cube_near_player(_configured_settings: None) -> None
                 ),
             )
 
-    changed = _changed_blocks(before, world.blocks)
+    changed = world.diff(before)
     stone_coords = {coord for coord, block_id in changed.items() if block_id == "minecraft:stone"}
 
     assert len(changed) == 27
@@ -218,7 +268,7 @@ def test_adds_door_on_south_wall_of_existing_room(_configured_settings: None) ->
     world = HeadlessVoxelWorld()
     world.flat_terrain(radius=24)
     world.box_walls(origin=(-2, 64, -2), size=(5, 3, 5), block_id="minecraft:oak_planks")
-    before = dict(world.blocks)
+    before = world.snapshot()
 
     app = create_app()
     client_id = "spatial-door-client"
@@ -236,7 +286,7 @@ def test_adds_door_on_south_wall_of_existing_room(_configured_settings: None) ->
                 ),
             )
 
-    changed = _changed_blocks(before, world.blocks)
+    changed = world.diff(before)
     door_coords = [coord for coord, block_id in changed.items() if block_id.endswith("_door")]
 
     assert door_coords
@@ -247,7 +297,7 @@ def test_adds_door_on_south_wall_of_existing_room(_configured_settings: None) ->
 def test_builds_5_block_tall_pillar(_configured_settings: None) -> None:
     world = HeadlessVoxelWorld()
     world.flat_terrain(radius=24)
-    before = dict(world.blocks)
+    before = world.snapshot()
 
     app = create_app()
     client_id = "spatial-pillar-client"
@@ -265,18 +315,18 @@ def test_builds_5_block_tall_pillar(_configured_settings: None) -> None:
                 ),
             )
 
-    changed = _changed_blocks(before, world.blocks)
-    assert len(changed) >= 5
-    for y in range(64, 69):
-        assert world.block_at((0, y, 0)) == "minecraft:stone"
-    pillar_coords = {(0, y, 0) for y in range(64, 69)}
+    changed = world.diff(before)
+    pillar_coords = {coord for coord, block_id in changed.items() if block_id == "minecraft:stone"}
+    assert_region_is(world, range(0, 1), range(64, 69), range(0, 1), "minecraft:stone")
     assert _is_connected(pillar_coords)
+    assert_footprint_matches(pillar_coords, {(0, 0)})
+    assert_height_profile(pillar_coords, 64, 68)
 
 
 def test_builds_wall_connecting_two_points(_configured_settings: None) -> None:
     world = HeadlessVoxelWorld()
     world.flat_terrain(radius=24)
-    before = dict(world.blocks)
+    before = world.snapshot()
 
     app = create_app()
     client_id = "spatial-wall-client"
@@ -294,11 +344,102 @@ def test_builds_wall_connecting_two_points(_configured_settings: None) -> None:
                 ),
             )
 
-    changed = _changed_blocks(before, world.blocks)
-    assert len(changed) >= 27
-    for x in range(-4, 5):
-        for y in range(64, 67):
-            assert world.block_at((x, y, 0)) == "minecraft:cobblestone"
+    changed = world.diff(before)
+    wall_coords = {coord for coord, block_id in changed.items() if block_id == "minecraft:cobblestone"}
+    assert_region_is(world, range(-4, 5), range(64, 67), range(0, 1), "minecraft:cobblestone")
+    assert _is_connected(wall_coords)
+    assert_height_profile(wall_coords, 64, 66)
+    assert_footprint_matches(wall_coords, {(x, 0) for x in range(-4, 5)})
+
+
+def test_builds_fence_post_wall_with_inclusive_endpoints(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+    before = world.snapshot()
+
+    app = create_app()
+    client_id = "spatial-fencepost-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message=(
+                    "Build a straight minecraft:cobblestone row from x=-4 to x=4 at y=64 and z=1. "
+                    "Make it exactly one block tall and include both endpoints."
+                ),
+            )
+
+    changed = world.diff(before)
+    wall_coords = {coord for coord, block_id in changed.items() if block_id == "minecraft:cobblestone"}
+    assert len(wall_coords) == 9
+    assert_region_is(world, range(-4, 5), range(64, 65), range(1, 2), "minecraft:cobblestone")
+    assert world.block_at((-5, 64, 1)) != "minecraft:cobblestone"
+    assert world.block_at((5, 64, 1)) != "minecraft:cobblestone"
+    assert_footprint_matches(wall_coords, {(x, 1) for x in range(-4, 5)})
+    assert_height_profile(wall_coords, 64, 64)
+
+
+def test_builds_hollow_5x5x5_cube_shell(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+    before = world.snapshot()
+
+    app = create_app()
+    client_id = "spatial-hollow-cube-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message=(
+                    "Build a hollow 5x5x5 minecraft:stone cube with corners at (-2,64,-2) and (2,68,2). "
+                    "Keep every interior block as air."
+                ),
+            )
+
+    changed = world.diff(before)
+    stone_coords = {coord for coord, block_id in changed.items() if block_id == "minecraft:stone"}
+    assert len(stone_coords) == 98
+    assert _is_connected(stone_coords)
+    assert_height_profile(stone_coords, 64, 68)
+    assert_footprint_matches(stone_coords, {(x, z) for x in range(-2, 3) for z in range(-2, 3)})
+    assert_is_hollow_box(world, min_corner=(-2, 64, -2), max_corner=(2, 68, 2), shell_block="minecraft:stone")
+
+
+@pytest.mark.quick_spatial
+def test_builds_tower_in_front_of_player_from_facing(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld(player=PlayerState(x=5, y=64, z=-3, facing="east"))
+    world.flat_terrain(radius=24)
+    before = world.snapshot()
+
+    app = create_app()
+    client_id = "spatial-forward-tower-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message="Build a 3-block-tall minecraft:stone tower directly in front of me.",
+            )
+
+    dx, dz = _forward_offset(world.player.facing)
+    expected = {(world.player.x + dx, y, world.player.z + dz) for y in range(world.player.y, world.player.y + 3)}
+    changed = world.diff(before)
+    stone_coords = {coord for coord, block_id in changed.items() if block_id == "minecraft:stone"}
+    assert stone_coords == expected
+    assert _is_connected(stone_coords)
+    assert_height_profile(stone_coords, world.player.y, world.player.y + 2)
+    assert_footprint_matches(stone_coords, {(world.player.x + dx, world.player.z + dz)})
 
 
 def test_replaces_oak_walls_with_birch(_configured_settings: None) -> None:
@@ -340,7 +481,7 @@ def test_adds_roof_to_open_room(_configured_settings: None) -> None:
         floor_block="minecraft:stone",
         wall_block="minecraft:oak_planks",
     )
-    before = dict(world.blocks)
+    before = world.snapshot()
 
     app = create_app()
     client_id = "spatial-roof-client"
@@ -358,11 +499,9 @@ def test_adds_roof_to_open_room(_configured_settings: None) -> None:
                 ),
             )
 
-    changed = _changed_blocks(before, world.blocks)
+    changed = world.diff(before)
     assert len(changed) >= 25
-    for x in range(-2, 3):
-        for z in range(-2, 3):
-            assert world.block_at((x, 67, z)) == "minecraft:oak_planks"
+    assert_region_is(world, range(-2, 3), range(67, 68), range(-2, 3), "minecraft:oak_planks")
 
 
 def test_multi_turn_room_modify_sequence_single_session(_configured_settings: None) -> None:
@@ -385,7 +524,7 @@ def test_multi_turn_room_modify_sequence_single_session(_configured_settings: No
                 ),
             )
 
-            wall_positions: list[tuple[int, int, int]] = []
+            wall_positions: list[Coord] = []
             for x in range(-2, 3):
                 for y in range(64, 67):
                     for z in range(-2, 3):
@@ -431,3 +570,48 @@ def test_multi_turn_room_modify_sequence_single_session(_configured_settings: No
                 if (x, y, z) in {(0, 64, 2), (0, 65, 2)} and block_id.endswith("_door"):
                     continue
                 assert block_id == "minecraft:birch_planks"
+
+
+@pytest.mark.quick_spatial
+def test_undo_then_rebuild_uses_undo_last(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+    before = world.snapshot()
+
+    app = create_app()
+    client_id = "spatial-undo-rebuild-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message="Build a 2x2 minecraft:stone platform centered on me at y=64.",
+            )
+            first_pass = world.diff(before)
+            assert any(block_id == "minecraft:stone" for block_id in first_pass.values())
+
+            second_turn_tools: list[str] = []
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message=(
+                    "Undo that and instead build a straight line of minecraft:birch_planks from x=-2 to x=2 "
+                    "at y=64 and z=0."
+                ),
+                tool_requests=second_turn_tools,
+            )
+
+    assert "undo_last" in second_turn_tools
+
+    final_changed = world.diff(before)
+    birch_coords = {coord for coord, block_id in final_changed.items() if block_id == "minecraft:birch_planks"}
+    expected_line = {(x, 64, 0) for x in range(-2, 3)}
+    assert birch_coords == expected_line
+    assert all(block_id != "minecraft:stone" for block_id in final_changed.values())
+    assert_height_profile(birch_coords, 64, 64)
+    assert_footprint_matches(birch_coords, {(x, 0) for x in range(-2, 3)})

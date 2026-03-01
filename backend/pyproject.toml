@@ -42,5 +42,6 @@ asyncio_mode = "auto"
 pythonpath = ["src", "../sim/src"]
 markers = [
   "spatial: live Anthropic spatial reasoning scenarios against the headless voxel simulator",
+  "quick_spatial: reduced spatial subset for fast iteration while using -m spatial --quick",
 ]
 addopts = "-m \"not spatial\""

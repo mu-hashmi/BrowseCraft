@@ -97,10 +97,17 @@ public final class BrowseCraftClient implements ClientModInitializer {
     private long overlayPlacementRevision;
     private long chatBuildTestBaselineRevision;
     private long chatBuildTestObservedRevision;
+    private int buildTestStepSequence;
+    private String buildTestStepId;
+    private long buildTestStepStartedAtMillis = -1;
+    private long buildTestStepFirstPlacementAtMillis = -1;
+    private long buildTestStepReadyForCaptureAtMillis = -1;
+    private int buildTestStepTickCount;
     private String buildTestTrigger = "build-test";
     private String buildTestPrompt;
     private int toolCallSequence;
     private final List<JsonObject> buildTestToolCalls = new ArrayList<>();
+    private final List<JsonObject> buildTestStatusTimeline = new ArrayList<>();
     private int inventoryPollCountdown;
     private volatile String latestStatusMessage = "";
 
@@ -116,6 +123,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
         Executor mainExecutor = runnable -> MinecraftClient.getInstance().execute(runnable);
         Consumer<String> statusSink = message -> {
             latestStatusMessage = message;
+            recordBuildTestStatusEvent(message);
             MinecraftClient client = MinecraftClient.getInstance();
             if (client.player != null) {
                 client.player.sendMessage(Text.literal(message), true);
@@ -287,7 +295,11 @@ public final class BrowseCraftClient implements ClientModInitializer {
             }
 
             if (chatBuildTestWaitTicksRemaining >= 0) {
+                buildTestStepTickCount++;
                 if (overlayPlacementRevision > chatBuildTestBaselineRevision) {
+                    if (buildTestStepFirstPlacementAtMillis < 0) {
+                        buildTestStepFirstPlacementAtMillis = System.currentTimeMillis();
+                    }
                     if (overlayPlacementRevision != chatBuildTestObservedRevision) {
                         chatBuildTestObservedRevision = overlayPlacementRevision;
                         chatBuildTestStableTicks = 0;
@@ -296,6 +308,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
                     }
                     if (latestStatusMessage.startsWith("chat: ") && chatBuildTestStableTicks >= CHAT_BUILD_TEST_SETTLE_TICKS) {
                         chatBuildTestWaitTicksRemaining = -1;
+                        buildTestStepReadyForCaptureAtMillis = System.currentTimeMillis();
                         buildTestCaptureTicksRemaining = 5;
                     }
                 } else if (chatBuildTestWaitTicksRemaining == 0) {
@@ -310,6 +323,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
             }
 
             if (buildTestCaptureTicksRemaining >= 0) {
+                buildTestStepTickCount++;
                 buildTestCaptureTicksRemaining--;
                 if (buildTestCaptureTicksRemaining == 0) {
                     captureBuildTestArtifacts(client);
@@ -325,9 +339,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
         latestBuildTestJsonPath = null;
         latestBuildTestScreenshotPath = null;
-        buildTestTrigger = "build-test";
-        buildTestPrompt = null;
-        resetBuildTestToolTrace();
+        beginBuildTestTrace("build-test", null);
         chatBuildTestWaitTicksRemaining = -1;
         BuildPlan testPlan = createBuildTestPlan();
         overlayState.setPlan(testPlan);
@@ -343,9 +355,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
         latestBuildTestJsonPath = null;
         latestBuildTestScreenshotPath = null;
-        buildTestTrigger = "chat";
-        buildTestPrompt = message;
-        resetBuildTestToolTrace();
+        beginBuildTestTrace("chat", message);
         buildTestCaptureTicksRemaining = -1;
         chatBuildTestWaitTicksRemaining = CHAT_BUILD_TEST_TIMEOUT_TICKS;
         chatBuildTestBaselineRevision = overlayPlacementRevision;
@@ -548,6 +558,8 @@ public final class BrowseCraftClient implements ClientModInitializer {
         try {
             OverlaySnapshot snapshot = overlayState.snapshot();
             GhostRenderer.RenderFrameSnapshot renderSnapshot = ghostRenderer.latestFrameSnapshot();
+            long capturedAtMillis = System.currentTimeMillis();
+            long artifactTimestamp = Instant.now().toEpochMilli();
 
             Path runDir = client.runDirectory.toPath();
             Path buildTestDir = runDir.resolve("browsecraft").resolve("build-test");
@@ -555,8 +567,9 @@ public final class BrowseCraftClient implements ClientModInitializer {
             Files.createDirectories(buildTestDir);
             Files.createDirectories(screenshotsDir);
 
-            Path jsonPath = buildTestDir.resolve("ghost-state.json");
-            Path screenshotPath = screenshotsDir.resolve("browsecraft-build-test-" + Instant.now().toEpochMilli() + ".png");
+            Path jsonPath = buildTestDir.resolve("ghost-state-" + artifactTimestamp + ".json");
+            Path latestJsonPath = buildTestDir.resolve("ghost-state.json");
+            Path screenshotPath = screenshotsDir.resolve("browsecraft-build-test-" + artifactTimestamp + ".png");
 
             JsonObject root = new JsonObject();
             JsonObject test = new JsonObject();
@@ -565,6 +578,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
                 test.addProperty("prompt", buildTestPrompt);
             }
             root.add("test", test);
+            root.add("step", buildTestStepMetadata(capturedAtMillis));
             root.add("overlay", overlayToJson(snapshot));
             root.add("validation", validationToJson(snapshot));
             JsonArray toolCalls = new JsonArray();
@@ -574,6 +588,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
                 }
             }
             root.add("tool_calls", toolCalls);
+            root.add("status_timeline", buildTestStatusTimelineJson());
             JsonObject backend = new JsonObject();
             backend.addProperty("latest_status_message", latestStatusMessage);
             root.add("backend", backend);
@@ -593,7 +608,9 @@ public final class BrowseCraftClient implements ClientModInitializer {
                 root.add("player", player);
             }
 
-            Files.writeString(jsonPath, GSON.toJson(root));
+            String payload = GSON.toJson(root);
+            Files.writeString(jsonPath, payload);
+            Files.writeString(latestJsonPath, payload);
             ScreenshotRecorder.saveScreenshot(
                     client.runDirectory,
                     screenshotPath.getFileName().toString(),
@@ -662,22 +679,30 @@ public final class BrowseCraftClient implements ClientModInitializer {
     }
 
     private JsonObject dispatchToolRequest(MinecraftClient client, String tool, JsonObject params) {
-        JsonObject result = switch (tool) {
-            case "player_position" -> toolPlayerPosition(client);
-            case "player_inventory" -> toolPlayerInventory(client);
-            case "inspect_area" -> toolInspectArea(client, params);
-            case "place_blocks" -> toolPlaceBlocks(client, params);
-            case "fill_region" -> toolFillRegion(client, params);
-            case "undo_last" -> toolUndoLast();
-            case "get_active_overlay" -> activeOverlaySummary(overlayState.snapshot());
-            case "modify_overlay" -> toolModifyOverlay(params);
-            case "get_blueprints" -> toolGetBlueprints(client);
-            case "save_blueprint" -> toolSaveBlueprint(client, params);
-            case "load_blueprint" -> toolLoadBlueprint(client, params);
-            default -> throw new IllegalArgumentException("Unsupported tool: " + tool);
-        };
-        recordBuildTestToolCall(tool, params, result);
-        return result;
+        long startedAtMillis = System.currentTimeMillis();
+        try {
+            JsonObject result = switch (tool) {
+                case "player_position" -> toolPlayerPosition(client);
+                case "player_inventory" -> toolPlayerInventory(client);
+                case "inspect_area" -> toolInspectArea(client, params);
+                case "place_blocks" -> toolPlaceBlocks(client, params);
+                case "fill_region" -> toolFillRegion(client, params);
+                case "undo_last" -> toolUndoLast();
+                case "get_active_overlay" -> activeOverlaySummary(overlayState.snapshot());
+                case "modify_overlay" -> toolModifyOverlay(params);
+                case "get_blueprints" -> toolGetBlueprints(client);
+                case "save_blueprint" -> toolSaveBlueprint(client, params);
+                case "load_blueprint" -> toolLoadBlueprint(client, params);
+                default -> throw new IllegalArgumentException("Unsupported tool: " + tool);
+            };
+            long completedAtMillis = System.currentTimeMillis();
+            recordBuildTestToolCall(tool, params, result, null, startedAtMillis, completedAtMillis);
+            return result;
+        } catch (RuntimeException | Error error) {
+            long completedAtMillis = System.currentTimeMillis();
+            recordBuildTestToolCall(tool, params, null, error, startedAtMillis, completedAtMillis);
+            throw error;
+        }
     }
 
     private JsonObject toolPlayerPosition(MinecraftClient client) {
@@ -1134,6 +1159,19 @@ public final class BrowseCraftClient implements ClientModInitializer {
         instance.runChatBuildTestCommand(MinecraftClient.getInstance(), message, resetOverlay);
     }
 
+    private void beginBuildTestTrace(String trigger, String prompt) {
+        buildTestTrigger = trigger;
+        buildTestPrompt = prompt;
+        resetBuildTestToolTrace();
+        resetBuildTestStatusTimeline();
+        buildTestStepSequence++;
+        buildTestStepId = trigger + "-" + buildTestStepSequence + "-" + System.currentTimeMillis();
+        buildTestStepStartedAtMillis = System.currentTimeMillis();
+        buildTestStepFirstPlacementAtMillis = -1;
+        buildTestStepReadyForCaptureAtMillis = -1;
+        buildTestStepTickCount = 0;
+    }
+
     private void resetBuildTestToolTrace() {
         synchronized (buildTestToolCalls) {
             buildTestToolCalls.clear();
@@ -1141,19 +1179,93 @@ public final class BrowseCraftClient implements ClientModInitializer {
         toolCallSequence = 0;
     }
 
-    private void recordBuildTestToolCall(String tool, JsonObject params, JsonObject result) {
+    private void resetBuildTestStatusTimeline() {
+        synchronized (buildTestStatusTimeline) {
+            buildTestStatusTimeline.clear();
+        }
+    }
+
+    private void recordBuildTestStatusEvent(String message) {
+        if (buildTestStepId == null) {
+            return;
+        }
+        JsonObject entry = new JsonObject();
+        long nowMillis = System.currentTimeMillis();
+        entry.addProperty("at_ms", nowMillis);
+        entry.addProperty("at", isoTimestamp(nowMillis));
+        entry.addProperty("message", message);
+        synchronized (buildTestStatusTimeline) {
+            buildTestStatusTimeline.add(entry);
+        }
+    }
+
+    private JsonArray buildTestStatusTimelineJson() {
+        JsonArray timeline = new JsonArray();
+        synchronized (buildTestStatusTimeline) {
+            for (JsonObject event : buildTestStatusTimeline) {
+                timeline.add(event.deepCopy());
+            }
+        }
+        return timeline;
+    }
+
+    private JsonObject buildTestStepMetadata(long capturedAtMillis) {
+        JsonObject step = new JsonObject();
+        if (buildTestStepId != null) {
+            step.addProperty("id", buildTestStepId);
+        }
+        step.addProperty("sequence", buildTestStepSequence);
+        step.addProperty("started_at_ms", buildTestStepStartedAtMillis);
+        step.addProperty("started_at", isoTimestamp(buildTestStepStartedAtMillis));
+        if (buildTestStepFirstPlacementAtMillis >= 0) {
+            step.addProperty("first_placement_at_ms", buildTestStepFirstPlacementAtMillis);
+            step.addProperty("first_placement_at", isoTimestamp(buildTestStepFirstPlacementAtMillis));
+            step.addProperty("time_to_first_placement_ms", buildTestStepFirstPlacementAtMillis - buildTestStepStartedAtMillis);
+        }
+        if (buildTestStepReadyForCaptureAtMillis >= 0) {
+            step.addProperty("ready_for_capture_at_ms", buildTestStepReadyForCaptureAtMillis);
+            step.addProperty("ready_for_capture_at", isoTimestamp(buildTestStepReadyForCaptureAtMillis));
+            step.addProperty("time_to_ready_ms", buildTestStepReadyForCaptureAtMillis - buildTestStepStartedAtMillis);
+        }
+        step.addProperty("captured_at_ms", capturedAtMillis);
+        step.addProperty("captured_at", isoTimestamp(capturedAtMillis));
+        step.addProperty("elapsed_ms", capturedAtMillis - buildTestStepStartedAtMillis);
+        step.addProperty("tick_count", buildTestStepTickCount);
+        return step;
+    }
+
+    private void recordBuildTestToolCall(
+            String tool,
+            JsonObject params,
+            JsonObject result,
+            Throwable error,
+            long startedAtMillis,
+            long completedAtMillis
+    ) {
         JsonObject entry = new JsonObject();
         entry.addProperty("seq", ++toolCallSequence);
         entry.addProperty("tool", tool);
+        entry.addProperty("started_at_ms", startedAtMillis);
+        entry.addProperty("started_at", isoTimestamp(startedAtMillis));
+        entry.addProperty("completed_at_ms", completedAtMillis);
+        entry.addProperty("completed_at", isoTimestamp(completedAtMillis));
+        entry.addProperty("duration_ms", completedAtMillis - startedAtMillis);
         if (params != null) {
             entry.add("params", summarizeToolParams(tool, params));
         }
         if (result != null) {
             entry.add("result", summarizeToolResult(tool, result));
         }
+        if (error != null) {
+            entry.addProperty("error", error.getClass().getName() + ": " + error.getMessage());
+        }
         synchronized (buildTestToolCalls) {
             buildTestToolCalls.add(entry);
         }
+    }
+
+    private String isoTimestamp(long epochMillis) {
+        return Instant.ofEpochMilli(epochMillis).toString();
     }
 
     private JsonObject summarizeToolParams(String tool, JsonObject params) {

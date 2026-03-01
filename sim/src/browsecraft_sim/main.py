@@ -48,6 +48,23 @@ class HeadlessVoxelWorld:
     def block_at(self, coord: Coord) -> str:
         return self.blocks.get(coord, "minecraft:air")
 
+    def snapshot(self) -> dict[Coord, str]:
+        return dict(self.blocks)
+
+    def diff(
+        self,
+        before: dict[Coord, str],
+        after: dict[Coord, str] | None = None,
+    ) -> dict[Coord, str]:
+        compared_after = self.blocks if after is None else after
+        changed: dict[Coord, str] = {}
+        for coord in set(before) | set(compared_after):
+            before_block = before.get(coord, "minecraft:air")
+            after_block = compared_after.get(coord, "minecraft:air")
+            if before_block != after_block:
+                changed[coord] = after_block
+        return changed
+
     def set_block(self, coord: Coord, block_id: str) -> None:
         canonical_block_id = block_id.split("[", 1)[0]
         if canonical_block_id == "minecraft:air":
