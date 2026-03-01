@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from anthropic import AsyncAnthropic
 from lmnr import observe
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from .convex_client import ConvexHttpClient
 from .models import (
@@ -26,16 +26,27 @@ from .websocket_manager import WebSocketManager
 
 logger = logging.getLogger(__name__)
 
-CHAT_MODEL = "claude-opus-4-6"
+CHAT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_WORLD_ID = "default"
 _SYSTEM_PROMPT = (
     "You are BrowseCraft's Minecraft in-game assistant.\n"
-    "Keep responses concise.\n"
-    "Before requesting world or overlay modifications, use relevant read-only tools first.\n"
+    "Keep responses concise and action-oriented.\n"
+    "Minecraft coordinates: +x=east, -x=west, +y=up, -y=down, +z=south, -z=north.\n"
+    "On flat terrain the ground is usually y=63 and player feet are usually y=64. "
+    "Ground-level builds should typically start around y=64 or y=65 unless user says otherwise.\n"
+    "Do not create floating structures unless explicitly requested. Ensure builds are grounded or attached.\n"
+    "Before modifying existing structures, inspect first. Use inspect_area with detailed=true when position-level data is needed.\n"
+    "When inspecting, start with small radii (4-6). Expand radius only when strictly necessary.\n"
+    "If a request references walls/faces, map orientation using coordinates: south face = max z, north face = min z, "
+    "east face = max x, west face = min x.\n"
+    "For large builds, split work into multiple place_blocks calls instead of one huge placement list.\n"
+    "If a placement batch is clearly wrong, call undo_last and retry with corrected coordinates.\n"
     "Use tools for factual game state instead of guessing."
 )
-_MAX_TOOL_ROUNDS = 12
+_MAX_TOOL_ROUNDS = 20
 _CONTEXT_MESSAGE_LIMIT = 12
+_MAX_MODEL_OUTPUT_TOKENS = 768
+_PROMPT_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
 _MEMORY_OUTCOME_TOOLS = {
     "place_blocks",
     "undo_last",
@@ -68,7 +79,14 @@ class _BlockPositionArgs(_ToolArgs):
 
 class _InspectAreaArgs(_ToolArgs):
     center: _BlockPositionArgs
-    radius: int = Field(ge=0, le=16)
+    radius: int = Field(ge=0, le=12)
+    detailed: bool = False
+
+    @model_validator(mode="after")
+    def validate_detailed_radius(self) -> _InspectAreaArgs:
+        if self.detailed and self.radius > 6:
+            raise ValueError("inspect_area with detailed=true requires radius <= 6")
+        return self
 
 
 class _PlaceBlocksArgs(_ToolArgs):
@@ -204,7 +222,10 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "inspect_area",
-        "description": "Inspect blocks around a center position with a radius.",
+        "description": (
+            "Inspect blocks around a center position with a radius. "
+            "Set detailed=true to include non-air block coordinates."
+        ),
         "input_schema": _InspectAreaArgs.model_json_schema(),
     },
     {
@@ -473,8 +494,9 @@ class ChatOrchestrator:
     ) -> Any:
         return await client.messages.create(
             model=model,
-            max_tokens=1024,
+            max_tokens=_MAX_MODEL_OUTPUT_TOKENS,
             temperature=0,
+            cache_control=_PROMPT_CACHE_CONTROL,
             system=system_prompt,
             tools=_TOOL_SCHEMAS,
             messages=messages,

@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     convex_url: str | None = None
     convex_access_key: str | None = None
     anthropic_api_key: str | None = None
-    anthropic_chat_model: str = "claude-opus-4-6"
+    anthropic_chat_model: str = "claude-sonnet-4-6"
     supermemory_api_key: str | None = None
 
 

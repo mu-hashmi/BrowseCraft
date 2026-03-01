@@ -646,9 +646,12 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
         BlockPos center = requiredBlockPos(params, "center");
         int requestedRadius = requiredInt(params, "radius");
-        int radius = Math.min(16, Math.max(0, requestedRadius));
+        boolean detailed = params.has("detailed") && requiredBoolean(params, "detailed");
+        int maxRadius = detailed ? 6 : 12;
+        int radius = Math.min(maxRadius, Math.max(0, requestedRadius));
         ClientWorld world = client.world;
         Map<String, Integer> blockCounts = new TreeMap<>();
+        JsonArray nonAirBlocks = detailed ? new JsonArray() : null;
         int sampledBlocks = 0;
 
         for (int dx = -radius; dx <= radius; dx++) {
@@ -657,6 +660,14 @@ public final class BrowseCraftClient implements ClientModInitializer {
                     BlockPos pos = center.add(dx, dy, dz);
                     String blockId = Registries.BLOCK.getId(world.getBlockState(pos).getBlock()).toString();
                     blockCounts.merge(blockId, 1, Integer::sum);
+                    if (detailed && !"minecraft:air".equals(blockId)) {
+                        JsonObject block = new JsonObject();
+                        block.addProperty("x", pos.getX());
+                        block.addProperty("y", pos.getY());
+                        block.addProperty("z", pos.getZ());
+                        block.addProperty("block_id", blockId);
+                        nonAirBlocks.add(block);
+                    }
                     sampledBlocks++;
                 }
             }
@@ -673,6 +684,10 @@ public final class BrowseCraftClient implements ClientModInitializer {
         result.addProperty("sampled_blocks", sampledBlocks);
         result.add("center", blockPosToJson(center));
         result.add("block_counts", countsJson);
+        result.addProperty("detailed", detailed);
+        if (detailed) {
+            result.add("non_air_blocks", nonAirBlocks);
+        }
         return result;
     }
 
@@ -902,6 +917,14 @@ public final class BrowseCraftClient implements ClientModInitializer {
             throw new IllegalArgumentException("Expected integer field: " + key);
         }
         return element.getAsInt();
+    }
+
+    private boolean requiredBoolean(JsonObject object, String key) {
+        JsonElement element = object.get(key);
+        if (element == null || !element.isJsonPrimitive() || !element.getAsJsonPrimitive().isBoolean()) {
+            throw new IllegalArgumentException("Expected boolean field: " + key);
+        }
+        return element.getAsBoolean();
     }
 
     private String normalizeBlockId(String blockId) {

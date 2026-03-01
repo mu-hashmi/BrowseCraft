@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import os
 from typing import Any
 
 import pytest
@@ -20,7 +21,11 @@ def _dispatch_tool(world: HeadlessVoxelWorld, tool: str, params: dict[str, Any])
     if tool == "player_inventory":
         return world.player_inventory()
     if tool == "inspect_area":
-        return world.inspect_area(center=params["center"], radius=int(params["radius"]))
+        return world.inspect_area(
+            center=params["center"],
+            radius=int(params["radius"]),
+            detailed=bool(params.get("detailed", False)),
+        )
     if tool == "place_blocks":
         placements = params["placements"]
         if not isinstance(placements, list):
@@ -67,7 +72,7 @@ def _run_chat_round_trip(
     world: HeadlessVoxelWorld,
     client_id: str,
     message: str,
-    max_events: int = 300,
+    max_events: int = 600,
 ) -> str:
     response = client.post(
         "/v1/chat",
@@ -149,7 +154,12 @@ def _is_connected(coords: set[tuple[int, int, int]]) -> bool:
 
 @pytest.fixture
 def _configured_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_CHAT_MODEL", "claude-opus-4-6")
+    spatial_model = (
+        os.getenv("ANTHROPIC_SPATIAL_MODEL")
+        or os.getenv("ANTHROPIC_CHAT_MODEL")
+        or "claude-sonnet-4-6"
+    )
+    monkeypatch.setenv("ANTHROPIC_CHAT_MODEL", spatial_model)
     get_settings.cache_clear()
     settings = get_settings()
     if not settings.anthropic_api_key:
@@ -225,3 +235,124 @@ def test_adds_door_on_south_wall_of_existing_room(_configured_settings: None) ->
     assert door_coords
     assert (0, 64, 2) in door_coords
     assert (0, 65, 2) in door_coords
+
+
+def test_builds_5_block_tall_pillar(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+    before = dict(world.blocks)
+
+    app = create_app()
+    client_id = "spatial-pillar-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message=(
+                    "Build a minecraft:stone pillar exactly 5 blocks tall at x=0,z=0, "
+                    "starting from y=64 and ending at y=68."
+                ),
+            )
+
+    changed = _changed_blocks(before, world.blocks)
+    assert len(changed) >= 5
+    for y in range(64, 69):
+        assert world.block_at((0, y, 0)) == "minecraft:stone"
+    pillar_coords = {(0, y, 0) for y in range(64, 69)}
+    assert _is_connected(pillar_coords)
+
+
+def test_builds_wall_connecting_two_points(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+    before = dict(world.blocks)
+
+    app = create_app()
+    client_id = "spatial-wall-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message=(
+                    "Build a straight minecraft:cobblestone wall connecting (-4,64,0) to (4,64,0). "
+                    "Make the wall 3 blocks tall."
+                ),
+            )
+
+    changed = _changed_blocks(before, world.blocks)
+    assert len(changed) >= 27
+    for x in range(-4, 5):
+        for y in range(64, 67):
+            assert world.block_at((x, y, 0)) == "minecraft:cobblestone"
+
+
+def test_replaces_oak_walls_with_birch(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+    world.box_walls(origin=(-2, 64, -2), size=(5, 3, 5), block_id="minecraft:oak_planks")
+
+    app = create_app()
+    client_id = "spatial-replace-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message=(
+                    "Inspect the room around me and replace every minecraft:oak_planks wall block "
+                    "with minecraft:birch_planks at the same coordinates."
+                ),
+            )
+
+    for x in range(-2, 3):
+        for y in range(64, 67):
+            for z in range(-2, 3):
+                is_wall = x in {-2, 2} or z in {-2, 2}
+                if not is_wall:
+                    continue
+                assert world.block_at((x, y, z)) == "minecraft:birch_planks"
+
+
+def test_adds_roof_to_open_room(_configured_settings: None) -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=24)
+    world.floor_with_walls(
+        origin=(-2, 63, -2),
+        size=(5, 4, 5),
+        floor_block="minecraft:stone",
+        wall_block="minecraft:oak_planks",
+    )
+    before = dict(world.blocks)
+
+    app = create_app()
+    client_id = "spatial-roof-client"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/ws/{client_id}") as websocket:
+            _run_chat_round_trip(
+                client=client,
+                websocket=websocket,
+                world=world,
+                client_id=client_id,
+                message=(
+                    "Add a flat minecraft:oak_planks roof to this open room. "
+                    "The room footprint is x=-2..2 and z=-2..2, so place the roof at y=67."
+                ),
+            )
+
+    changed = _changed_blocks(before, world.blocks)
+    assert len(changed) >= 25
+    for x in range(-2, 3):
+        for z in range(-2, 3):
+            assert world.block_at((x, 67, z)) == "minecraft:oak_planks"

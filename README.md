@@ -7,7 +7,7 @@ BrowseCraft is a hackathon prototype focused on one interface: `/chat`. The in-g
 ```mermaid
 flowchart LR
   A["Minecraft + Fabric Mod"] -->|"/chat, /session"| B["FastAPI Backend"]
-  B -->|tool use + reasoning| E["Claude Opus 4.6"]
+  B -->|tool use + reasoning| E["Claude Sonnet 4.6 (default)"]
   B <-->|tool.request / tool.response| A
   B -->|sessions + blueprints persistence| F["Convex (optional)"]
   B -->|long-term memory retrieval/store| G["Supermemory (optional)"]

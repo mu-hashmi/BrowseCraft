@@ -195,6 +195,8 @@ async def test_place_blocks_tool_routes_through_websocket_manager_and_emits_chat
 
     first_call = anthropic_client.messages.calls[0]
     assert first_call["model"] == CHAT_MODEL
+    assert first_call["max_tokens"] == 768
+    assert first_call["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert {tool["name"] for tool in first_call["tools"]} == EXPECTED_TOOL_NAMES
 
     assert ws.sent_payloads[0][0] == "client-1"
@@ -228,7 +230,7 @@ async def test_world_tool_routes_through_websocket_manager() -> None:
         (
             "client-2",
             "inspect_area",
-            {"center": {"x": 10, "y": 64, "z": 20}, "radius": 4},
+            {"center": {"x": 10, "y": 64, "z": 20}, "radius": 4, "detailed": False},
         )
     ]
     assert ws.sent_payloads[0][1]["payload"]["message"] == "Area inspected."
@@ -259,6 +261,33 @@ async def test_invalid_tool_args_are_reported_back_to_model() -> None:
     assert "Invalid arguments for inspect_area" in tool_result["content"]
     assert ws.tool_requests == []
     assert ws.sent_payloads[0][1]["payload"]["message"] == "Please provide center coordinates."
+
+
+@pytest.mark.asyncio
+async def test_detailed_inspect_radius_limit_is_reported_back_to_model() -> None:
+    anthropic_client = FakeAnthropicClient(
+        responses=[
+            _tool_use_response(
+                "inspect_area",
+                {"center": {"x": 0, "y": 64, "z": 0}, "radius": 8, "detailed": True},
+            ),
+            _text_response("Use a smaller radius for detailed inspection."),
+        ]
+    )
+    ws = FakeWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    await orchestrator._run_chat(chat_id="chat-limit", client_id="client-limit", user_message="inspect room detail")
+
+    second_call = anthropic_client.messages.calls[1]
+    tool_result = second_call["messages"][-1]["content"][0]
+    assert tool_result["is_error"] is True
+    assert "inspect_area with detailed=true requires radius <= 6" in tool_result["content"]
+    assert ws.tool_requests == []
 
 
 @pytest.mark.asyncio

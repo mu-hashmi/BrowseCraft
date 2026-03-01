@@ -62,25 +62,44 @@ class HeadlessVoxelWorld:
             self.set_block(coord, previous_block)
         return {"undone_count": len(history)}
 
-    def inspect_area(self, *, center: dict[str, Any], radius: int) -> dict[str, Any]:
+    def inspect_area(self, *, center: dict[str, Any], radius: int, detailed: bool = False) -> dict[str, Any]:
         cx = int(center["x"])
         cy = int(center["y"])
         cz = int(center["z"])
-        clamped_radius = max(0, min(16, int(radius)))
+        max_radius = 6 if detailed else 12
+        clamped_radius = max(0, min(max_radius, int(radius)))
 
         counts: Counter[str] = Counter()
+        non_air_blocks: list[dict[str, Any]] = []
         for dx in range(-clamped_radius, clamped_radius + 1):
             for dy in range(-clamped_radius, clamped_radius + 1):
                 for dz in range(-clamped_radius, clamped_radius + 1):
-                    counts[self.block_at((cx + dx, cy + dy, cz + dz))] += 1
+                    x = cx + dx
+                    y = cy + dy
+                    z = cz + dz
+                    block_id = self.block_at((x, y, z))
+                    counts[block_id] += 1
+                    if detailed and block_id != "minecraft:air":
+                        non_air_blocks.append(
+                            {
+                                "x": x,
+                                "y": y,
+                                "z": z,
+                                "block_id": block_id,
+                            }
+                        )
 
-        return {
+        result = {
             "requested_radius": int(radius),
             "radius": clamped_radius,
             "sampled_blocks": (2 * clamped_radius + 1) ** 3,
             "center": {"x": cx, "y": cy, "z": cz},
             "block_counts": dict(sorted(counts.items())),
+            "detailed": detailed,
         }
+        if detailed:
+            result["non_air_blocks"] = non_air_blocks
+        return result
 
     def player_position(self) -> dict[str, Any]:
         return {
@@ -232,7 +251,11 @@ def _dispatch_tool(world: HeadlessVoxelWorld, tool: str, params: dict[str, Any])
     if tool == "player_inventory":
         return world.player_inventory()
     if tool == "inspect_area":
-        return world.inspect_area(center=params["center"], radius=int(params["radius"]))
+        return world.inspect_area(
+            center=params["center"],
+            radius=int(params["radius"]),
+            detailed=bool(params.get("detailed", False)),
+        )
     if tool == "place_blocks":
         placements = params["placements"]
         if not isinstance(placements, list):
