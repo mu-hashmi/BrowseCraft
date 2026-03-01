@@ -2,7 +2,32 @@
 
 This is a hackathon project. Production-readiness is unnecessary.
 
-## Run Tests
+## Preferred Codex Test Workflow
+
+For `/build` debugging, use a real end-to-end loop that is fully programmatic. Do not stop at unit tests or curl-only checks.
+
+### Non-negotiables
+
+- Do not use GUI automation.
+- Do not rely on manual clicking/typing to validate `/build`.
+- Validate Minecraft ingestion/rendering, not just backend acceptance.
+- `/build` source is Browser Use only. Treat non-`browser_use` source as failure.
+
+### Required env keys
+
+Set in `backend/.env`:
+
+| Key                                | Required for                     |
+| ---------------------------------- | -------------------------------- |
+| `BROWSER_USE_API_KEY`              | `/build` discovery/download      |
+| `CONVEX_URL` + `CONVEX_ACCESS_KEY` | session persistence (if used)    |
+| `ANTHROPIC_API_KEY`                | `/chat` and image-plan paths     |
+| `GOOGLE_API_KEY`                   | `/imagine` image generation only |
+| `SUPERMEMORY_API_KEY`              | optional chat memory persistence |
+
+Optional: `LAMINAR_API_KEY`.
+
+### 1) Fast checks before E2E
 
 ```bash
 cd ~/BrowseCraft/backend && uv run pytest -q
@@ -10,113 +35,67 @@ cd ~/BrowseCraft/mod && gradle test
 cd ~/BrowseCraft/mod && gradle build
 ```
 
-## Verify Outputs
+### 2) Start backend cleanly on 8080
 
-The closest thing to a real user test is the in-game `/build-test` command. Run a clean gametest and check:
+Use `tmux` and ensure port `8080` is not occupied by stale processes.
+
+```bash
+lsof -nP -iTCP:8080 -sTCP:LISTEN || true
+cd ~/BrowseCraft/backend
+tmux new-session -d -s browsecraft-backend 'uv run uvicorn browsecraft_backend.app:app --host 127.0.0.1 --port 8080 --log-level info 2>&1 | tee /tmp/browsecraft-backend.log'
+curl -s http://127.0.0.1:8080/health
+```
+
+### 3) Run programmatic in-game E2E
+
+Use client gametest (programmatic, no GUI input):
 
 ```bash
 cd ~/BrowseCraft/mod && gradle deleteGameTestRunDir runClientGameTest
-cat ~/BrowseCraft/mod/build/run/clientGameTest/browsecraft/build-test/ghost-state.json | jq '{validation, render_status, render_status_observed}'
+```
+
+The gametest must submit a real build query through the same backend path used by `/build`, then capture artifacts after `job.ready`.
+
+### 4) Verify required artifacts
+
+```bash
+cat ~/BrowseCraft/mod/build/run/clientGameTest/browsecraft/build-test/ghost-state.json | jq '{validation, backend, render_status, render_status_observed}'
 LATEST_SHOT=$(find ~/BrowseCraft/mod/build/run/clientGameTest/screenshots -type f | sort | tail -1)
 echo "$LATEST_SHOT"
 ls -lh "$LATEST_SHOT"
 file "$LATEST_SHOT"
 ```
 
-The screenshot must show ghost block wireframe outlines in front of the player and must be non-empty (`size > 0`).
+Pass criteria:
 
-## E2E Debug Loop
+- `validation.passed == true`
+- `backend.latest_ready_source_type == "browser_use"`
+- `render_status_observed == true`
+- screenshot file exists, is non-empty, and visibly shows ghost wireframe outlines
+- latest backend run has `POST /v1/jobs ... 200` (no `422`/`5xx`)
+- IMPORTANT: the only REAL source of truth is if the screenshot visibly shows ghost wireframe outlines
 
-Unit tests use fakes. The real validation is whether features work in Minecraft.
+### 5) Iterate
 
-### API Keys
+After each code change:
 
-Set in `backend/.env`:
+1. restart backend
+2. rerun `runClientGameTest`
+3. re-check `ghost-state.json`, screenshot, and backend log
 
-| Key                                | Required for                             |
-| ---------------------------------- | ---------------------------------------- |
-| `ANTHROPIC_API_KEY`                | /imagine (vision) + /chat (orchestrator) |
-| `GOOGLE_API_KEY`                   | /imagine (Gemini image gen)              |
-| `BROWSER_USE_API_KEY`              | /build (Planet Minecraft browsing)       |
-| `SUPERMEMORY_API_KEY`              | /chat memory across interactions         |
-| `CONVEX_URL` + `CONVEX_ACCESS_KEY` | Session persistence across restarts      |
+## Manual Live Run (Optional)
 
-Optional: `LAMINAR_API_KEY` (tracing, helpful for debugging).
-
-### Start the backend
-
-```bash
-cd ~/BrowseCraft/backend
-uv run uvicorn browsecraft_backend.app:app --host 127.0.0.1 --port 8080 --log-level info 2>&1 | tee /tmp/browsecraft-backend.log &
-curl -s http://127.0.0.1:8080/health
-```
-
-### Ghost block rendering (no API keys needed)
+If the user wants manual confirmation in a real client session:
 
 ```bash
-cd ~/BrowseCraft/mod && gradle deleteGameTestRunDir runClientGameTest
+cd ~/BrowseCraft/mod && gradle runClient
 ```
 
-Artifacts:
+Then user runs `/build ...` manually while agent inspects backend and artifact logs from terminal.
 
-- `mod/build/run/clientGameTest/browsecraft/build-test/ghost-state.json` — must have `"passed": true`
-- `mod/build/run/clientGameTest/screenshots/` — must show colored wireframe outlines
+## Common Failure Signals
 
-Common failure modes:
-
-- `EntrypointException` + `ClassNotFoundException: dev.browsecraft.mod.BrowseCraftClientGameTests`:
-  keep `BrowseCraftClientGameTests` in `mod/src/client/java/dev/browsecraft/mod/` so `runClientGameTest` can load it.
-- `ghost-state.json` says `render_status_observed=true` but screenshot is empty (`0B`):
-  screenshot capture path is broken; treat this as test failure.
-
-### Live feature testing
-
-Start Minecraft: `cd ~/BrowseCraft/mod && gradle runClient`
-
-If Convex is configured and `/chat` or `/session` fails with `sessions:upsert` / `sessions:listByWorld` not found, run:
-
-```bash
-cd ~/BrowseCraft
-npx convex dev --once
-```
-
-The mod auto-connects to the backend via WebSocket. Test features with curl:
-
-```bash
-# /imagine
-curl -s -X POST http://127.0.0.1:8080/v1/imagine \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"small stone tower","client_id":"test"}'
-
-# /imagine modify (requires a prior /imagine for the same client_id)
-curl -s -X POST http://127.0.0.1:8080/v1/imagine/modify \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"add a wooden door","client_id":"test"}'
-
-# /chat
-curl -s -X POST http://127.0.0.1:8080/v1/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"What tools do you have?","client_id":"test"}'
-
-# /build
-curl -s -X POST http://127.0.0.1:8080/v1/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"small oak house","mc_version":"1.21.11","client_id":"test"}'
-
-# Poll job status
-curl -s http://127.0.0.1:8080/v1/jobs/<job_id>
-```
-
-Note: `/chat` responses stream over WebSocket (`chat.delta`/`chat.response`). If the mod is not connected with the same `client_id`, curl alone only confirms request acceptance.
-
-### What to look at
-
-- Backend logs: `/tmp/browsecraft-backend.log`
-- Browser Use dashboard: cloud.browser-use.com (agent recordings for /build)
-- Laminar dashboard (if configured): per-call LLM traces with prompts/responses
-- Minecraft screenshots: `mod/build/run/client/screenshots/` or `mod/build/run/clientGameTest/screenshots/`
-- Any other logs generated
-
-### Fix → retest
-
-Restart the backend after code changes. Always run unit tests first (`uv run pytest -q` / `gradle test`) before retesting live.
+- `build submit failed: ... 422 ... Field required`: malformed/empty POST body from mod client.
+- `runOnClient called when no client is running`: client closed during gametest run.
+- `render_status_observed=true` but empty screenshot: screenshot pipeline bug; treat as failure.
+- `ClassNotFoundException: dev.browsecraft.mod.BrowseCraftClientGameTests`: wrong class/package location; keep it under `mod/src/client/java/dev/browsecraft/mod/`.
