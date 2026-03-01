@@ -17,6 +17,7 @@ from .models import (
     BuildRequest,
     ChatAcceptedResponse,
     ChatRequest,
+    ImagineModifyRequest,
     ImagineRequest,
     JobStatusResponse,
     SessionCreatedResponse,
@@ -59,6 +60,8 @@ def _build_browser_use(settings: Settings) -> BrowserUseService:
         primary_model=settings.browser_use_primary_llm,
         fallback_model=settings.browser_use_fallback_llm,
         timeout_seconds=settings.browser_use_task_timeout_seconds,
+        planet_minecraft_skill_id=settings.browser_use_planet_minecraft_skill_id,
+        profile_id=settings.browser_use_profile_id,
     )
 
 
@@ -66,6 +69,8 @@ def _build_imagine_service(settings: Settings) -> ImagineService:
     return ImagineService(
         google_api_key=settings.google_api_key,
         anthropic_api_key=settings.anthropic_api_key,
+        anthropic_vision_model=settings.anthropic_vision_model,
+        use_gemini_text_plan=settings.imagine_use_gemini_text_plan,
     )
 
 
@@ -96,6 +101,8 @@ def _build_chat_orchestrator(
         anthropic_api_key=settings.anthropic_api_key,
         job_manager=jobs,
         websocket_manager=ws_manager,
+        chat_model=settings.anthropic_chat_model,
+        escalation_model=settings.anthropic_chat_escalation_model,
     )
 
 
@@ -131,7 +138,7 @@ def create_app(
         if settings.convex_url
         else None
     )
-    supermemory = SupermemoryClient(settings.supermemory_api_key, client) if settings.supermemory_api_key else None
+    supermemory = SupermemoryClient(settings.supermemory_api_key) if settings.supermemory_api_key else None
     jobs = job_factory(settings, client, ws_manager, discovery, browser_service, imagine_pipeline)
     chat = chat_factory(settings, jobs, ws_manager)
     if isinstance(chat, ChatOrchestrator):
@@ -151,6 +158,8 @@ def create_app(
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         await client.aclose()
+        if supermemory is not None:
+            await supermemory.close()
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -163,6 +172,10 @@ def create_app(
     @app.post("/v1/imagine", response_model=BuildJobCreated)
     async def create_imagine_job(payload: ImagineRequest) -> BuildJobCreated:
         return await jobs.create_imagine_job(payload)
+
+    @app.post("/v1/imagine/modify", response_model=BuildJobCreated)
+    async def create_imagine_modify_job(payload: ImagineModifyRequest) -> BuildJobCreated:
+        return await jobs.create_imagine_modify_job(payload)
 
     @app.post("/v1/chat", response_model=ChatAcceptedResponse)
     async def create_chat(payload: ChatRequest) -> ChatAcceptedResponse:

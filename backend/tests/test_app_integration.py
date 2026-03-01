@@ -77,8 +77,9 @@ class DummyBrowserUse:
         query: str,
         mc_version: str,
         allowed_exts: tuple[str, ...],
+        on_progress=None,
     ) -> list[CandidateFile]:
-        del query, mc_version, allowed_exts
+        del query, mc_version, allowed_exts, on_progress
         return []
 
 
@@ -86,10 +87,36 @@ class DummyImagineService:
     def __init__(self, plan: BuildPlan) -> None:
         self._plan = plan
         self.prompts: list[str] = []
+        self.modify_prompts: list[str] = []
 
     async def build_plan(self, prompt: str) -> BuildPlan:
         self.prompts.append(prompt)
         return self._plan
+
+    async def build_plan_result(self, prompt: str):
+        self.prompts.append(prompt)
+        return _dummy_imagine_result(self._plan)
+
+    async def modify_plan_result(
+        self,
+        prompt: str,
+        reference_image_data: bytes,
+        reference_image_mime_type: str,
+    ):
+        del reference_image_data, reference_image_mime_type
+        self.modify_prompts.append(prompt)
+        return _dummy_imagine_result(self._plan)
+
+
+def _dummy_imagine_result(plan: BuildPlan):
+    class _Result:
+        def __init__(self, plan: BuildPlan) -> None:
+            self.plan = plan
+            self.image_data = b"image-bytes"
+            self.image_mime_type = "image/png"
+            self.plan_source = "anthropic_vision"
+
+    return _Result(plan)
 
 
 class DummyChatOrchestrator:
@@ -283,6 +310,70 @@ def test_imagine_happy_path_emits_expected_event_sequence() -> None:
             assert body["source"]["type"] == "imagine"
             assert body["plan"]["total_blocks"] == 2
             assert imagine_service.prompts == ["tiny stone hut"]
+
+
+def test_imagine_modify_happy_path_emits_expected_event_sequence() -> None:
+    def blocked_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"Unexpected network call: {request.url}")
+
+    imagine_plan = BuildPlan(
+        total_blocks=2,
+        placements=[
+            BlockPlacement(dx=0, dy=0, dz=0, block_id="minecraft:stone"),
+            BlockPlacement(dx=1, dy=0, dz=0, block_id="minecraft:oak_planks"),
+        ],
+    )
+    imagine_service = DummyImagineService(plan=imagine_plan)
+    app = create_app(
+        http_client=lambda: httpx.AsyncClient(transport=httpx.MockTransport(blocked_handler)),
+        source_discovery=lambda client, settings: EmptyDiscovery(),
+        browser_use=lambda settings: DummyBrowserUse(),
+        imagine_service=lambda settings: imagine_service,
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/ws/imagine-client") as websocket:
+            first_response = client.post(
+                "/v1/imagine",
+                json={
+                    "prompt": "tiny stone hut",
+                    "client_id": "imagine-client",
+                },
+            )
+            first_response.raise_for_status()
+            [websocket.receive_json() for _ in range(4)]
+
+            response = client.post(
+                "/v1/imagine/modify",
+                json={
+                    "prompt": "add a tower",
+                    "client_id": "imagine-client",
+                },
+            )
+            response.raise_for_status()
+            job_id = response.json()["job_id"]
+
+            events = [websocket.receive_json() for _ in range(4)]
+            assert [event["type"] for event in events] == [
+                "job.status",
+                "job.status",
+                "job.status",
+                "job.ready",
+            ]
+            assert [event["payload"]["message"] for event in events[:3]] == [
+                "editing image",
+                "converting to blocks",
+                "ready",
+            ]
+
+            status_response = client.get(f"/v1/jobs/{job_id}")
+            status_response.raise_for_status()
+            body = status_response.json()
+            assert body["stage"] == "ready"
+            assert body["source"]["type"] == "imagine"
+            assert body["plan"]["total_blocks"] == 2
+            assert imagine_service.prompts == ["tiny stone hut"]
+            assert imagine_service.modify_prompts == ["add a tower"]
 
 
 def test_chat_endpoint_returns_accepted_with_chat_id() -> None:

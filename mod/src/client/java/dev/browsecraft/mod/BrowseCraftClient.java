@@ -163,6 +163,13 @@ public final class BrowseCraftClient implements ClientModInitializer {
                     }));
 
             dispatcher.register(literal("imagine")
+                    .then(literal("modify")
+                            .then(argument("prompt", StringArgumentType.greedyString())
+                                    .executes(context -> {
+                                        String prompt = StringArgumentType.getString(context, "prompt");
+                                        commandController.submitImagineModify(prompt);
+                                        return 1;
+                                    })))
                     .then(argument("prompt", StringArgumentType.greedyString())
                             .executes(context -> {
                                 String prompt = StringArgumentType.getString(context, "prompt");

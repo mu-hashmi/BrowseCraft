@@ -61,6 +61,18 @@ public final class BuildCommandController implements BuildBackendListener {
         });
     }
 
+    public void submitImagineModify(String prompt) {
+        statusSink.accept("editing image...");
+        workerExecutor.execute(() -> {
+            try {
+                String jobId = backend.submitImagineModifyPrompt(prompt, clientId);
+                activeJobId.set(jobId);
+            } catch (Exception error) {
+                mainExecutor.execute(() -> statusSink.accept("imagine modify failed: " + error.getMessage()));
+            }
+        });
+    }
+
     public void submitChat(String message) {
         submitChat(message, null);
     }

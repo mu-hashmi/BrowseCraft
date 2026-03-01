@@ -92,6 +92,11 @@ class ImagineRequest(BaseModel):
     client_id: str = Field(min_length=1)
 
 
+class ImagineModifyRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    client_id: str = Field(min_length=1)
+
+
 class ChatRequest(BaseModel):
     client_id: str = Field(min_length=1)
     message: str = Field(min_length=1)

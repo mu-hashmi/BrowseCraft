@@ -10,6 +10,8 @@ public interface BuildBackend {
 
     String submitImaginePrompt(String prompt, String clientId) throws IOException, InterruptedException;
 
+    String submitImagineModifyPrompt(String prompt, String clientId) throws IOException, InterruptedException;
+
     void submitChatMessage(
             String message,
             String clientId,

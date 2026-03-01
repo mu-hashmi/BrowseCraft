@@ -7,7 +7,7 @@ import pytest
 from google.genai import types
 from pydantic import ValidationError
 
-from browsecraft_backend.imagine_service import ImagineService
+from browsecraft_backend.imagine_service import ANTHROPIC_VISION_MODEL, ImagineService
 
 
 class FakeGoogleModels:
@@ -110,7 +110,7 @@ async def test_build_plan_happy_path_uses_expected_models() -> None:
     google_call = google_client.aio.models.calls[0]
     assert google_call["model"] == "gemini-3.1-flash-image-preview"
     anthropic_call = anthropic_client.messages.calls[0]
-    assert anthropic_call["model"] == "claude-opus-4-6"
+    assert anthropic_call["model"] == ANTHROPIC_VISION_MODEL
     assert google_client.aio.closed is True
     assert anthropic_client.closed is True
 

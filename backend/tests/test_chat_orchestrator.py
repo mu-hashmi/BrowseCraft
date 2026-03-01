@@ -10,7 +10,7 @@ import pytest
 from browsecraft_backend.chat_orchestrator import CHAT_MODEL, ChatOrchestrator
 from browsecraft_backend.convex_client import ConvexHttpClient
 from browsecraft_backend.models import BuildJobCreated, BuildRequest, ImagineRequest
-from browsecraft_backend.supermemory_client import SupermemorySearchResult
+from browsecraft_backend.supermemory_client import SupermemoryProfileContext, SupermemorySearchResult
 
 
 EXPECTED_TOOL_NAMES = {
@@ -106,8 +106,14 @@ class FakeConvexClient(ConvexHttpClient):
 
 
 class FakeSupermemoryClient:
-    def __init__(self, search_results: list[SupermemorySearchResult] | None = None) -> None:
+    def __init__(
+        self,
+        search_results: list[SupermemorySearchResult] | None = None,
+        profile_context: SupermemoryProfileContext | None = None,
+    ) -> None:
         self.search_results = search_results or []
+        self._profile_context = profile_context or SupermemoryProfileContext(static=(), dynamic=())
+        self.profile_calls: list[str] = []
         self.search_calls: list[dict[str, Any]] = []
         self.store_calls: list[dict[str, Any]] = []
 
@@ -126,6 +132,10 @@ class FakeSupermemoryClient:
             }
         )
         return self.search_results
+
+    async def profile_context(self, container_tag: str) -> SupermemoryProfileContext:
+        self.profile_calls.append(container_tag)
+        return self._profile_context
 
     async def store_memory(
         self,
@@ -385,7 +395,11 @@ async def test_supermemory_is_used_for_context_and_meaningful_tool_outcomes() ->
         ]
     )
     supermemory = FakeSupermemoryClient(
-        search_results=[SupermemorySearchResult(text="User prefers oak builds.", similarity=0.91)]
+        search_results=[SupermemorySearchResult(text="User prefers oak builds.", similarity=0.91)],
+        profile_context=SupermemoryProfileContext(
+            static=("User plays in survival mode.",),
+            dynamic=("Currently building with oak and stone.",),
+        ),
     )
     jobs = FakeJobManager()
     ws = FakeWebSocketManager()
@@ -401,7 +415,10 @@ async def test_supermemory_is_used_for_context_and_meaningful_tool_outcomes() ->
 
     first_call = anthropic_client.messages.calls[0]
     assert "Relevant long-term memory" in first_call["system"]
+    assert "Profile static:" in first_call["system"]
+    assert "Profile dynamic:" in first_call["system"]
     assert "User prefers oak builds." in first_call["system"]
+    assert supermemory.profile_calls == ["default:client-6"]
     assert supermemory.search_calls == [
         {
             "query": "build something",

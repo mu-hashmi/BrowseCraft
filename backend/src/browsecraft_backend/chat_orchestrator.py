@@ -9,6 +9,7 @@ from typing import Annotated, Any, Callable, Literal, Protocol
 from uuid import uuid4
 
 from anthropic import AsyncAnthropic
+from lmnr import observe
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from .convex_client import ConvexHttpClient
@@ -23,12 +24,13 @@ from .models import (
     SessionSummary,
     SessionSwitchedResponse,
 )
-from .supermemory_client import SupermemorySearchResult
+from .supermemory_client import SupermemoryProfileContext, SupermemorySearchResult
 from .websocket_manager import WebSocketManager
 
 logger = logging.getLogger(__name__)
 
-CHAT_MODEL = "claude-opus-4-6"
+CHAT_MODEL = "claude-sonnet-4-20250514"
+CHAT_ESCALATION_MODEL = "claude-opus-4-1-20250805"
 DEFAULT_MC_VERSION = "1.21.11"
 _DEFAULT_WORLD_ID = "default"
 _SYSTEM_PROMPT = (
@@ -46,6 +48,17 @@ _MEMORY_OUTCOME_TOOLS = {
     "save_blueprint",
     "load_blueprint",
 }
+_OPUS_ESCALATION_HINTS = (
+    "castle",
+    "blueprint",
+    "terrain",
+    "cliff",
+    "symmetry",
+    "multi-floor",
+    "redstone",
+    "optimize",
+    "layout",
+)
 
 
 class _ToolArgs(BaseModel):
@@ -169,6 +182,9 @@ class SupermemoryClientProtocol(Protocol):
     ) -> None:
         ...
 
+    async def profile_context(self, container_tag: str) -> SupermemoryProfileContext:
+        ...
+
 
 _TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -230,11 +246,15 @@ class ChatOrchestrator:
         anthropic_api_key: str | None,
         job_manager: JobManager,
         websocket_manager: WebSocketManager,
+        chat_model: str = CHAT_MODEL,
+        escalation_model: str = CHAT_ESCALATION_MODEL,
         anthropic_client_factory: AnthropicClientFactory | None = None,
         convex_client: ConvexHttpClient | None = None,
         supermemory_client: SupermemoryClientProtocol | None = None,
     ) -> None:
         self._anthropic_api_key = anthropic_api_key
+        self._chat_model = chat_model
+        self._escalation_model = escalation_model
         self._job_manager = job_manager
         self._websocket_manager = websocket_manager
         self._anthropic_client_factory = anthropic_client_factory or (lambda api_key: AsyncAnthropic(api_key=api_key))
@@ -324,6 +344,7 @@ class ChatOrchestrator:
         except Exception:
             logger.exception("Chat task failed")
 
+    @observe()
     async def _run_chat(
         self,
         chat_id: str,
@@ -341,6 +362,7 @@ class ChatOrchestrator:
                 requested_session_id=None,
             )
             assistant_text = await self._complete_chat(
+                chat_id=chat_id,
                 client_id=client_id,
                 world_id=resolved_world_id,
                 session_id=resolved_session_id,
@@ -365,8 +387,10 @@ class ChatOrchestrator:
             },
         )
 
+    @observe()
     async def _complete_chat(
         self,
+        chat_id: str,
         client_id: str,
         world_id: str,
         session_id: str,
@@ -391,16 +415,21 @@ class ChatOrchestrator:
                 f"{memory_context}"
             )
 
+        selected_model = _select_chat_model(
+            user_message=user_message,
+            default_model=self._chat_model,
+            escalation_model=self._escalation_model,
+        )
         client = self._anthropic_client_factory(self._anthropic_api_key)
         try:
             tool_rounds = 0
             while True:
-                response = await client.messages.create(
-                    model=CHAT_MODEL,
-                    max_tokens=1024,
-                    temperature=0,
-                    system=system_prompt,
-                    tools=_TOOL_SCHEMAS,
+                response = await self._run_model_round(
+                    client=client,
+                    model=selected_model,
+                    client_id=client_id,
+                    chat_id=chat_id,
+                    system_prompt=system_prompt,
                     messages=messages,
                 )
                 assistant_blocks = _normalize_assistant_blocks(response.content)
@@ -435,6 +464,50 @@ class ChatOrchestrator:
                 messages.append({"role": "user", "content": tool_results})
         finally:
             await client.close()
+
+    async def _run_model_round(
+        self,
+        *,
+        client: AsyncAnthropic,
+        model: str,
+        client_id: str,
+        chat_id: str,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+    ) -> Any:
+        if not hasattr(client.messages, "stream"):
+            return await client.messages.create(
+                model=model,
+                max_tokens=1024,
+                temperature=0,
+                system=system_prompt,
+                tools=_TOOL_SCHEMAS,
+                messages=messages,
+            )
+
+        partial_chunks: list[str] = []
+        async with client.messages.stream(
+            model=model,
+            max_tokens=1024,
+            temperature=0,
+            system=system_prompt,
+            tools=_TOOL_SCHEMAS,
+            messages=messages,
+        ) as stream:
+            async for chunk in stream.text_stream:
+                partial_chunks.append(chunk)
+                await self._websocket_manager.send_payload(
+                    client_id,
+                    {
+                        "type": "chat.delta",
+                        "chat_id": chat_id,
+                        "payload": {
+                            "delta": chunk,
+                            "partial": "".join(partial_chunks),
+                        },
+                    },
+                )
+            return await stream.get_final_message()
 
     async def _execute_tool(
         self,
@@ -595,12 +668,18 @@ class ChatOrchestrator:
         if self._supermemory_client is None:
             return ""
 
+        container_tag = _memory_container_tag(client_id=client_id, world_id=world_id)
+        profile_context = await self._supermemory_client.profile_context(container_tag=container_tag)
         memories = await self._supermemory_client.search_memories(
             user_message,
-            container_tag=_memory_container_tag(client_id=client_id, world_id=world_id),
+            container_tag=container_tag,
             limit=5,
         )
-        return _format_memory_context(memories)
+        memory_lines = _format_memory_context(memories)
+        profile_lines = _format_profile_context(profile_context)
+        if profile_lines and memory_lines:
+            return f"{profile_lines}\n{memory_lines}"
+        return profile_lines or memory_lines
 
     async def _store_tool_memory(
         self,
@@ -659,6 +738,25 @@ def _format_memory_context(memories: list[SupermemorySearchResult]) -> str:
             suffix = f" (similarity={memory.similarity:.2f})"
         lines.append(f"{index}. {memory.text}{suffix}")
     return "\n".join(lines)
+
+
+def _format_profile_context(profile: SupermemoryProfileContext) -> str:
+    lines: list[str] = []
+    if profile.static:
+        lines.append("Profile static:")
+        lines.extend(f"- {item}" for item in profile.static)
+    if profile.dynamic:
+        lines.append("Profile dynamic:")
+        lines.extend(f"- {item}" for item in profile.dynamic)
+    return "\n".join(lines)
+
+
+def _select_chat_model(user_message: str, default_model: str, escalation_model: str) -> str:
+    lowered = user_message.lower()
+    score = sum(1 for hint in _OPUS_ESCALATION_HINTS if hint in lowered)
+    if score >= 2:
+        return escalation_model
+    return default_model
 
 
 def _format_tool_memory_content(tool_name: str, params: dict[str, Any], result: dict[str, Any]) -> str:

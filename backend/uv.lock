@@ -70,6 +70,7 @@ dependencies = [
     { name = "nbtlib" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "supermemory" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -96,6 +97,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4.2" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.2.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.0.0" },
+    { name = "supermemory", specifier = ">=3.27.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.35.0" },
 ]
 provides-extras = ["dev"]
@@ -1293,6 +1295,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c4/68/79977123bb7be889ad680d79a40f339082c1978b5cfcf62c2d8d196873ac/starlette-0.52.1.tar.gz", hash = "sha256:834edd1b0a23167694292e94f597773bc3f89f362be6effee198165a35d62933", size = 2653702, upload-time = "2026-01-18T13:34:11.062Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/81/0d/13d1d239a25cbfb19e740db83143e95c772a1fe10202dda4b76792b114dd/starlette-0.52.1-py3-none-any.whl", hash = "sha256:0029d43eb3d273bc4f83a08720b4912ea4b071087a3b48db01b7c839f7954d74", size = 74272, upload-time = "2026-01-18T13:34:09.188Z" },
+]
+
+[[package]]
+name = "supermemory"
+version = "3.27.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4d/56/74c15cc168d02a5cada695677f63ba13de302d9e673f46809f0d735b37ad/supermemory-3.27.0.tar.gz", hash = "sha256:8aea44f4fd1fac4ce6ddd41f9aa1b86b97d21acc739389308f4d1e78265de468", size = 159531, upload-time = "2026-02-24T06:46:49.623Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/39/201e6bbe70eafdaf01ff86334df8f4731f05677e91cd626b87f311244092/supermemory-3.27.0-py3-none-any.whl", hash = "sha256:4db07c0090eb9ad8a85e47caf52d1184a023c73c61dd4d306acb337307501525", size = 144223, upload-time = "2026-02-24T06:46:48.327Z" },
 ]
 
 [[package]]

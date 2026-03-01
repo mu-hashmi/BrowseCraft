@@ -94,6 +94,14 @@ public final class BackendClient implements BuildBackend {
     }
 
     @Override
+    public String submitImagineModifyPrompt(String prompt, String clientId) throws IOException, InterruptedException {
+        JsonObject requestBody = new JsonObject();
+        requestBody.addProperty("prompt", prompt);
+        requestBody.addProperty("client_id", clientId);
+        return submitJobRequest("/v1/imagine/modify", requestBody);
+    }
+
+    @Override
     public void submitChatMessage(
             String message,
             String clientId,
@@ -319,6 +327,10 @@ public final class BackendClient implements BuildBackend {
             handleChatResponse(envelope);
             return;
         }
+        if ("chat.delta".equals(type)) {
+            handleChatDelta(envelope);
+            return;
+        }
         if ("tool.request".equals(type)) {
             handleToolRequest(socket, envelope);
             return;
@@ -335,6 +347,17 @@ public final class BackendClient implements BuildBackend {
         JsonObject payload = requiredObject(envelope, "payload");
         String message = requiredString(payload, "message");
         currentListener.onStatus("", "chat", message);
+    }
+
+    private void handleChatDelta(JsonObject envelope) {
+        BuildBackendListener currentListener = listener;
+        if (currentListener == null) {
+            return;
+        }
+
+        JsonObject payload = requiredObject(envelope, "payload");
+        String partial = requiredString(payload, "partial");
+        currentListener.onStatus("", "chat", partial);
     }
 
     private void handleToolRequest(WebSocket socket, JsonObject envelope) {
