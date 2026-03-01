@@ -33,3 +33,17 @@ def test_hud_env_registers_expected_tools_and_scenarios() -> None:
         "save_blueprint",
         "load_blueprint",
     }
+
+
+def test_hud_scenario_generator_protocol_round_trip() -> None:
+    pytest.importorskip("hud")
+    from browsecraft_sim.rl.hud_env import env
+
+    async def _run() -> None:
+        prompt = await env.run_scenario_setup("t1_absolute", {"seed": 17, "index": 0, "reward_config": {}})
+        assert isinstance(prompt, str) and prompt
+        await env.submit("t1_absolute", "")
+        result = await env.run_scenario_evaluate("t1_absolute")
+        assert 0.0 <= result.reward <= 1.0
+
+    asyncio.run(_run())

@@ -204,109 +204,35 @@ async def _run_scenario(
     config = RewardConfig.model_validate(reward_config or {})
     session, token = _start_session(task=task, reward_config=config)
     try:
-        _ = yield task.prompt
+        yield task.prompt
         yield _finish(session)
     finally:
         _CURRENT_SESSION.reset(token)
 
 
-@env.scenario("t1_absolute")
-async def t1_absolute(
-    task_spec: dict[str, Any] | None = None,
-    seed: int = 7,
-    index: int = 0,
-    reward_config: dict[str, Any] | None = None,
-) -> Any:
-    async for item in _run_scenario(
-        tier="t1_absolute",
-        task_spec=task_spec,
-        seed=seed,
-        index=index,
-        reward_config=reward_config,
-    ):
-        yield item
+def _register_scenario(tier: Tier, scenario_name: str) -> Any:
+    @env.scenario(scenario_name)
+    async def _scenario(
+        task_spec: dict[str, Any] | None = None,
+        seed: int = 7,
+        index: int = 0,
+        reward_config: dict[str, Any] | None = None,
+    ) -> Any:
+        async for item in _run_scenario(
+            tier=tier,
+            task_spec=task_spec,
+            seed=seed,
+            index=index,
+            reward_config=reward_config,
+        ):
+            yield item
+
+    return _scenario
 
 
-@env.scenario("t2_relative_single_ref")
-async def t2_relative_single_ref(
-    task_spec: dict[str, Any] | None = None,
-    seed: int = 7,
-    index: int = 0,
-    reward_config: dict[str, Any] | None = None,
-) -> Any:
-    async for item in _run_scenario(
-        tier="t2_relative_single_ref",
-        task_spec=task_spec,
-        seed=seed,
-        index=index,
-        reward_config=reward_config,
-    ):
-        yield item
-
-
-@env.scenario("t3_primitives")
-async def t3_primitives(
-    task_spec: dict[str, Any] | None = None,
-    seed: int = 7,
-    index: int = 0,
-    reward_config: dict[str, Any] | None = None,
-) -> Any:
-    async for item in _run_scenario(
-        tier="t3_primitives",
-        task_spec=task_spec,
-        seed=seed,
-        index=index,
-        reward_config=reward_config,
-    ):
-        yield item
-
-
-@env.scenario("t4_structure_relative")
-async def t4_structure_relative(
-    task_spec: dict[str, Any] | None = None,
-    seed: int = 7,
-    index: int = 0,
-    reward_config: dict[str, Any] | None = None,
-) -> Any:
-    async for item in _run_scenario(
-        tier="t4_structure_relative",
-        task_spec=task_spec,
-        seed=seed,
-        index=index,
-        reward_config=reward_config,
-    ):
-        yield item
-
-
-@env.scenario("t5_modification")
-async def t5_modification(
-    task_spec: dict[str, Any] | None = None,
-    seed: int = 7,
-    index: int = 0,
-    reward_config: dict[str, Any] | None = None,
-) -> Any:
-    async for item in _run_scenario(
-        tier="t5_modification",
-        task_spec=task_spec,
-        seed=seed,
-        index=index,
-        reward_config=reward_config,
-    ):
-        yield item
-
-
-@env.scenario("t6_composition")
-async def t6_composition(
-    task_spec: dict[str, Any] | None = None,
-    seed: int = 7,
-    index: int = 0,
-    reward_config: dict[str, Any] | None = None,
-) -> Any:
-    async for item in _run_scenario(
-        tier="t6_composition",
-        task_spec=task_spec,
-        seed=seed,
-        index=index,
-        reward_config=reward_config,
-    ):
-        yield item
+t1_absolute = _register_scenario("t1_absolute", "t1_absolute")
+t2_relative_single_ref = _register_scenario("t2_relative_single_ref", "t2_relative_single_ref")
+t3_primitives = _register_scenario("t3_primitives", "t3_primitives")
+t4_structure_relative = _register_scenario("t4_structure_relative", "t4_structure_relative")
+t5_modification = _register_scenario("t5_modification", "t5_modification")
+t6_composition = _register_scenario("t6_composition", "t6_composition")

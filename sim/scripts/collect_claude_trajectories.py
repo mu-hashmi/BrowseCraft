@@ -257,22 +257,26 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is required")
+    if args.concurrency <= 0:
+        raise ValueError("--concurrency must be > 0")
 
     reward_config = RewardConfig()
     tasks = generate_tasks(seed=args.seed, per_tier=args.per_tier)
     client = AsyncAnthropic(api_key=api_key)
-    try:
-        rows = []
-        for task in tasks:
-            rows.append(
-                await _run_episode(
-                    client,
-                    task=task,
-                    model=args.model,
-                    max_rounds=args.max_rounds,
-                    reward_config=reward_config,
-                )
+    semaphore = asyncio.Semaphore(args.concurrency)
+
+    async def run_one(task: Any) -> dict[str, Any]:
+        async with semaphore:
+            return await _run_episode(
+                client,
+                task=task,
+                model=args.model,
+                max_rounds=args.max_rounds,
+                reward_config=reward_config,
             )
+
+    try:
+        rows = await asyncio.gather(*(run_one(task) for task in tasks))
         return rows
     finally:
         await client.close()
@@ -284,6 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--per-tier", type=int, default=1)
     parser.add_argument("--max-rounds", type=int, default=20)
+    parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--output", default="raw_episodes.jsonl")
     return parser
 

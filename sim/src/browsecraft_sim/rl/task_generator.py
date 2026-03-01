@@ -249,9 +249,13 @@ def _build_t4_structure_relative(*, seed: int, index: int, rng: random.Random) -
         )
         checks = StructuralChecks(require_grounded=True)
     else:
-        room_origin = (-2, 64, -2)
+        room_origin = (rng.randint(-6, 2), 64, rng.randint(-6, 2))
+        room_width = 5
+        room_depth = 5
         setup = _room_shell(origin=room_origin, width=5, height=3, depth=5, wall_block="minecraft:oak_planks")
-        target = [BlockPlacement(x=0, y=65, z=2, block_id="minecraft:torch")]
+        south_face_center_x = room_origin[0] + (room_width // 2)
+        south_face_z = room_origin[2] + room_depth - 1
+        target = [BlockPlacement(x=south_face_center_x, y=65, z=south_face_z, block_id="minecraft:torch")]
         prompt = (
             "There is an oak plank room centered near you. "
             "Place one minecraft:torch at the center of the south wall (the wall with max z)."
@@ -290,13 +294,13 @@ def _build_t5_modification(*, seed: int, index: int, rng: random.Random) -> Task
         )
         checks = StructuralChecks(require_connected=True, require_grounded=True)
     else:
+        existing_doorway = {(0, 64, 0), (0, 65, 0)}
         setup = [
             BlockPlacement(x=x, y=y, z=0, block_id="minecraft:stone_bricks")
             for x in range(-3, 4)
             for y in range(64, 67)
+            if (x, y, 0) not in existing_doorway
         ]
-        for doorway in ((0, 64, 0), (0, 65, 0)):
-            setup.append(BlockPlacement(x=doorway[0], y=doorway[1], z=doorway[2], block_id="minecraft:air"))
         target = [
             BlockPlacement(x=x, y=y, z=0, block_id="minecraft:air")
             for x in (-1, 0, 1)
@@ -344,9 +348,10 @@ def _build_t6_composition(*, seed: int, index: int, rng: random.Random) -> TaskS
     else:
         room_a = _room_shell(origin=(-2, 64, -8), width=5, height=3, depth=5, wall_block="minecraft:stone_bricks")
         room_b = _room_shell(origin=(-2, 64, 4), width=5, height=3, depth=5, wall_block="minecraft:stone_bricks")
+        doorway_openings = {(0, 64, -4), (0, 65, -4), (0, 64, 4), (0, 65, 4)}
+        room_a = [block for block in room_a if (block.x, block.y, block.z) not in doorway_openings]
+        room_b = [block for block in room_b if (block.x, block.y, block.z) not in doorway_openings]
         setup = room_a + room_b
-        for doorway in ((0, 64, -4), (0, 65, -4), (0, 64, 4), (0, 65, 4)):
-            setup.append(BlockPlacement(x=doorway[0], y=doorway[1], z=doorway[2], block_id="minecraft:air"))
 
         target: list[BlockPlacement] = []
         for z in range(-3, 4):
