@@ -231,7 +231,7 @@ class BrowserUseService:
                 CandidateFile(
                     source="browser_use",
                     canonical_url=candidate.canonical_url,
-                    download_url=candidate.download_url or output_file.download_url,
+                    download_url=output_file.download_url,
                     filename=candidate_filename,
                     title=candidate.title,
                     score=candidate.score,

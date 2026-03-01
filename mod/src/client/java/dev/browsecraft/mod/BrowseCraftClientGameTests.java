@@ -8,21 +8,34 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 public final class BrowseCraftClientGameTests implements FabricClientGameTest {
+    private static final String BUILD_QUERY = "small oak house schematic";
+
     @Override
     public void runTest(ClientGameTestContext context) {
         TestSingleplayerContext singleplayer = context.worldBuilder().create();
         context.waitTicks(40);
 
-        context.runOnClient(client -> BrowseCraftClient.onBuildTestCommand());
+        context.runOnClient(client -> BrowseCraftClient.onBuildQueryForArtifacts(BUILD_QUERY));
 
         context.waitFor(client -> {
+            String latestStatus = BrowseCraftClient.latestStatusMessage();
+            if (latestStatus.startsWith("build submit failed: ")) {
+                throw new AssertionError(latestStatus);
+            }
+            if (latestStatus.startsWith("CONFIG_ERROR: ")) {
+                throw new AssertionError(latestStatus);
+            }
+            if (latestStatus.startsWith("INTERNAL_ERROR: ")) {
+                throw new AssertionError(latestStatus);
+            }
+
             Path jsonPath = BrowseCraftClient.latestBuildTestJsonPath();
             Path screenshotPath = BrowseCraftClient.latestBuildTestScreenshotPath();
             return jsonPath != null
                     && screenshotPath != null
                     && Files.exists(jsonPath)
                     && hasImageData(screenshotPath);
-        }, 300);
+        }, 6000);
 
         Path jsonPath = BrowseCraftClient.latestBuildTestJsonPath();
         Path screenshotPath = BrowseCraftClient.latestBuildTestScreenshotPath();
@@ -34,6 +47,9 @@ public final class BrowseCraftClientGameTests implements FabricClientGameTest {
             String json = Files.readString(jsonPath);
             if (!json.contains("\"passed\": true")) {
                 throw new AssertionError("validation.passed was not true in artifact JSON");
+            }
+            if (!json.contains("\"latest_ready_source_type\": \"browser_use\"")) {
+                throw new AssertionError("expected backend source browser_use in artifact JSON");
             }
             if (Files.size(screenshotPath) == 0) {
                 throw new AssertionError("build-test screenshot is empty");

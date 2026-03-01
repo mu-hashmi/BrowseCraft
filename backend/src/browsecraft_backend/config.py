@@ -7,8 +7,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     browser_use_api_key: str | None = None
-    github_token: str | None = None
-    curseforge_api_key: str | None = None
 
     browser_use_primary_llm: str = "browser-use-llm"
     browser_use_fallback_llm: str = "browser-use-2.0"

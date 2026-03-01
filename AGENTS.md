@@ -41,7 +41,7 @@ Set in `backend/.env`:
 | `SUPERMEMORY_API_KEY`              | /chat memory across interactions         |
 | `CONVEX_URL` + `CONVEX_ACCESS_KEY` | Session persistence across restarts      |
 
-Optional: `LAMINAR_API_KEY` (tracing, helpful for debugging), `GITHUB_TOKEN`, `CURSEFORGE_API_KEY` (extra schematic sources).
+Optional: `LAMINAR_API_KEY` (tracing, helpful for debugging).
 
 ### Start the backend
 

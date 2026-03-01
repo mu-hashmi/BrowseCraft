@@ -56,22 +56,10 @@ def _build_test_schem_bytes() -> bytes:
     return buf.getvalue()
 
 
-class SingleCandidateDiscovery:
-    def __init__(self, candidate: CandidateFile) -> None:
-        self._candidate = candidate
-
-    async def search(self, query: str, mc_version: str, allowed_exts: tuple[str, ...]) -> list[CandidateFile]:
-        del query, mc_version, allowed_exts
-        return [self._candidate]
-
-
-class EmptyDiscovery:
-    async def search(self, query: str, mc_version: str, allowed_exts: tuple[str, ...]) -> list[CandidateFile]:
-        del query, mc_version, allowed_exts
-        return []
-
-
 class DummyBrowserUse:
+    def __init__(self, candidates: list[CandidateFile] | None = None) -> None:
+        self._candidates = candidates or []
+
     async def discover_via_browsing(
         self,
         query: str,
@@ -80,7 +68,7 @@ class DummyBrowserUse:
         on_progress=None,
     ) -> list[CandidateFile]:
         del query, mc_version, allowed_exts, on_progress
-        return []
+        return list(self._candidates)
 
 
 class DummyImagineService:
@@ -167,8 +155,8 @@ def test_ready_path_emits_expected_event_sequence() -> None:
         return httpx.Response(404)
 
     candidate = CandidateFile(
-        source="github",
-        canonical_url="https://github.com/example/repo/file.schem",
+        source="browser_use",
+        canonical_url="https://www.planetminecraft.com/project/example/",
         download_url=download_url,
         filename="test.schem",
         title="Test schematic",
@@ -177,8 +165,7 @@ def test_ready_path_emits_expected_event_sequence() -> None:
 
     app = create_app(
         http_client=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        source_discovery=lambda client, settings: SingleCandidateDiscovery(candidate),
-        browser_use=lambda settings: DummyBrowserUse(),
+        browser_use=lambda settings: DummyBrowserUse([candidate]),
     )
 
     with TestClient(app) as client:
@@ -220,7 +207,6 @@ def test_no_candidates_emits_error_and_failed_status() -> None:
 
     app = create_app(
         http_client=lambda: httpx.AsyncClient(transport=httpx.MockTransport(blocked_handler)),
-        source_discovery=lambda client, settings: EmptyDiscovery(),
         browser_use=lambda settings: DummyBrowserUse(),
     )
 
@@ -272,7 +258,6 @@ def test_imagine_happy_path_emits_expected_event_sequence() -> None:
     imagine_service = DummyImagineService(plan=imagine_plan)
     app = create_app(
         http_client=lambda: httpx.AsyncClient(transport=httpx.MockTransport(blocked_handler)),
-        source_discovery=lambda client, settings: EmptyDiscovery(),
         browser_use=lambda settings: DummyBrowserUse(),
         imagine_service=lambda settings: imagine_service,
     )
@@ -326,7 +311,6 @@ def test_imagine_modify_happy_path_emits_expected_event_sequence() -> None:
     imagine_service = DummyImagineService(plan=imagine_plan)
     app = create_app(
         http_client=lambda: httpx.AsyncClient(transport=httpx.MockTransport(blocked_handler)),
-        source_discovery=lambda client, settings: EmptyDiscovery(),
         browser_use=lambda settings: DummyBrowserUse(),
         imagine_service=lambda settings: imagine_service,
     )
@@ -383,7 +367,6 @@ def test_chat_endpoint_returns_accepted_with_chat_id() -> None:
     chat = DummyChatOrchestrator()
     app = create_app(
         http_client=lambda: httpx.AsyncClient(transport=httpx.MockTransport(blocked_handler)),
-        source_discovery=lambda client, settings: EmptyDiscovery(),
         browser_use=lambda settings: DummyBrowserUse(),
         chat_orchestrator=lambda settings, jobs, ws_manager: chat,
     )
@@ -411,7 +394,6 @@ def test_session_endpoints_route_to_chat_orchestrator() -> None:
     chat = DummyChatOrchestrator()
     app = create_app(
         http_client=lambda: httpx.AsyncClient(transport=httpx.MockTransport(blocked_handler)),
-        source_discovery=lambda client, settings: EmptyDiscovery(),
         browser_use=lambda settings: DummyBrowserUse(),
         chat_orchestrator=lambda settings, jobs, ws_manager: chat,
     )

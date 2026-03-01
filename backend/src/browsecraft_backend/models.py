@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 JobStage = Literal["queued", "searching", "normalizing", "ready", "failed"]
-SourceType = Literal["github", "modrinth", "curseforge", "browser_use", "imagine"]
+SourceType = Literal["browser_use", "imagine"]
 EventType = Literal["job.status", "job.ready", "job.error"]
 
 

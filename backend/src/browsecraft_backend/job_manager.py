@@ -22,7 +22,7 @@ from .models import (
     SourceInfo,
 )
 from .schematic_parser import UnsupportedSchematicFormatError, parse_schematic_bytes
-from .sources import CandidateFile, SourceDiscovery
+from .sources import CandidateFile
 from .websocket_manager import WebSocketManager
 
 
@@ -44,14 +44,12 @@ class JobManager:
         settings: Settings,
         http_client: httpx.AsyncClient,
         websocket_manager: WebSocketManager,
-        source_discovery: SourceDiscovery,
         browser_use: BrowserUseService,
         imagine_service: ImaginePipeline,
     ) -> None:
         self._settings = settings
         self._http_client = http_client
         self._websocket_manager = websocket_manager
-        self._source_discovery = source_discovery
         self._browser_use = browser_use
         self._imagine_service = imagine_service
 
@@ -97,17 +95,10 @@ class JobManager:
     async def _execute_job(self, state: JobState) -> None:
         async with self._job_semaphore:
             await self._emit_status(state, "queued", "Job queued")
-            await self._emit_status(state, "searching", "Searching sources")
+            await self._emit_status(state, "searching", "Searching Browser Use sources")
             try:
-                api_task = self._source_discovery.search(
-                    query=state.query,
-                    mc_version=state.mc_version,
-                    allowed_exts=self._settings.allowed_download_exts,
-                )
-                browser_task = self._discover_via_browser_use(state)
-                api_candidates, browser_candidates = await asyncio.gather(api_task, browser_task)
-
-                candidates = self._rank_and_dedupe(api_candidates + browser_candidates)
+                browser_candidates = await self._discover_via_browser_use(state)
+                candidates = self._rank_and_dedupe(browser_candidates)
                 if not candidates:
                     raise JobFailure("NO_SCHEMATIC_FOUND", "No schematic candidates found")
 

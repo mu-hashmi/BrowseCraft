@@ -73,6 +73,9 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
     private int buildTestCaptureTicksRemaining = -1;
     private int inventoryPollCountdown;
+    private volatile boolean captureArtifactsOnNextReady;
+    private volatile String latestStatusMessage = "";
+    private volatile String latestReadySourceType = "";
 
     @Override
     public void onInitializeClient() {
@@ -85,6 +88,15 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
         Executor mainExecutor = runnable -> MinecraftClient.getInstance().execute(runnable);
         Consumer<String> statusSink = message -> {
+            latestStatusMessage = message;
+            String readySource = parseReadySourceType(message);
+            if (!readySource.isEmpty()) {
+                latestReadySourceType = readySource;
+                if (captureArtifactsOnNextReady) {
+                    captureArtifactsOnNextReady = false;
+                    buildTestCaptureTicksRemaining = 5;
+                }
+            }
             MinecraftClient client = MinecraftClient.getInstance();
             if (client.player != null) {
                 client.player.sendMessage(Text.literal(message), true);
@@ -299,6 +311,11 @@ public final class BrowseCraftClient implements ClientModInitializer {
         client.player.sendMessage(Text.literal("Loaded /build-test plan"), true);
     }
 
+    private void runBuildQueryForArtifacts(String query) {
+        captureArtifactsOnNextReady = true;
+        commandController.submit(query);
+    }
+
     private BuildPlan createBuildTestPlan() {
         List<BuildPlacement> placements = new ArrayList<>();
 
@@ -498,6 +515,10 @@ public final class BrowseCraftClient implements ClientModInitializer {
             JsonObject root = new JsonObject();
             root.add("overlay", overlayToJson(snapshot));
             root.add("validation", validationToJson(snapshot));
+            JsonObject backend = new JsonObject();
+            backend.addProperty("latest_status_message", latestStatusMessage);
+            backend.addProperty("latest_ready_source_type", latestReadySourceType);
+            root.add("backend", backend);
 
             JsonObject renderStatus = new JsonObject();
             renderStatus.addProperty("mode", renderSnapshot.mode().name());
@@ -832,11 +853,30 @@ public final class BrowseCraftClient implements ClientModInitializer {
         return element.getAsInt();
     }
 
+    private String parseReadySourceType(String message) {
+        if (!message.startsWith("ready from ")) {
+            return "";
+        }
+        int sourceStart = "ready from ".length();
+        int sourceEnd = message.indexOf(" (");
+        if (sourceEnd <= sourceStart) {
+            return "";
+        }
+        return message.substring(sourceStart, sourceEnd);
+    }
+
     public static void onBuildTestCommand() {
         if (instance == null) {
             return;
         }
         instance.runBuildTestCommand(MinecraftClient.getInstance());
+    }
+
+    public static void onBuildQueryForArtifacts(String query) {
+        if (instance == null) {
+            return;
+        }
+        instance.runBuildQueryForArtifacts(query);
     }
 
     public static Path latestBuildTestJsonPath() {
@@ -845,5 +885,19 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
     public static Path latestBuildTestScreenshotPath() {
         return latestBuildTestScreenshotPath;
+    }
+
+    public static String latestStatusMessage() {
+        if (instance == null) {
+            return "";
+        }
+        return instance.latestStatusMessage;
+    }
+
+    public static String latestReadySourceType() {
+        if (instance == null) {
+            return "";
+        }
+        return instance.latestReadySourceType;
     }
 }

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 
 from .browser_use_client import BrowserUseService
 from .chat_orchestrator import ChatOrchestrator
@@ -26,17 +29,17 @@ from .models import (
     SessionSwitchRequest,
     SessionSwitchedResponse,
 )
-from .sources import CurseForgeSourceAdapter, GitHubSourceAdapter, ModrinthSourceAdapter, SourceDiscovery
 from .sponsors import initialize_laminar, verify_sponsor_imports
 from .supermemory_client import SupermemoryClient
 from .websocket_manager import WebSocketManager
 
+logger = logging.getLogger(__name__)
+
 HttpClientFactory = Callable[[], httpx.AsyncClient]
-SourceDiscoveryFactory = Callable[[httpx.AsyncClient, Settings], SourceDiscovery]
 BrowserUseFactory = Callable[[Settings], BrowserUseService]
 ImagineServiceFactory = Callable[[Settings], ImaginePipeline]
 JobManagerFactory = Callable[
-    [Settings, httpx.AsyncClient, WebSocketManager, SourceDiscovery, BrowserUseService, ImaginePipeline],
+    [Settings, httpx.AsyncClient, WebSocketManager, BrowserUseService, ImaginePipeline],
     JobManager,
 ]
 ChatOrchestratorFactory = Callable[[Settings, JobManager, WebSocketManager], ChatOrchestrator]
@@ -44,14 +47,6 @@ ChatOrchestratorFactory = Callable[[Settings, JobManager, WebSocketManager], Cha
 
 def _build_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(follow_redirects=True, timeout=30.0)
-
-
-def _build_source_discovery(client: httpx.AsyncClient, settings: Settings) -> SourceDiscovery:
-    return SourceDiscovery(
-        github=GitHubSourceAdapter(token=settings.github_token, http_client=client),
-        modrinth=ModrinthSourceAdapter(http_client=client),
-        curseforge=CurseForgeSourceAdapter(api_key=settings.curseforge_api_key, http_client=client),
-    )
 
 
 def _build_browser_use(settings: Settings) -> BrowserUseService:
@@ -78,7 +73,6 @@ def _build_job_manager(
     settings: Settings,
     http_client: httpx.AsyncClient,
     ws_manager: WebSocketManager,
-    source_discovery: SourceDiscovery,
     browser_use: BrowserUseService,
     imagine_service: ImaginePipeline,
 ) -> JobManager:
@@ -86,7 +80,6 @@ def _build_job_manager(
         settings=settings,
         http_client=http_client,
         websocket_manager=ws_manager,
-        source_discovery=source_discovery,
         browser_use=browser_use,
         imagine_service=imagine_service,
     )
@@ -108,7 +101,6 @@ def _build_chat_orchestrator(
 def create_app(
     *,
     http_client: HttpClientFactory | None = None,
-    source_discovery: SourceDiscoveryFactory | None = None,
     browser_use: BrowserUseFactory | None = None,
     imagine_service: ImagineServiceFactory | None = None,
     job_manager: JobManagerFactory | None = None,
@@ -122,14 +114,12 @@ def create_app(
     ws_manager = WebSocketManager()
 
     client_factory = http_client or _build_http_client
-    source_factory = source_discovery or _build_source_discovery
     browser_factory = browser_use or _build_browser_use
     imagine_factory = imagine_service or _build_imagine_service
     job_factory = job_manager or _build_job_manager
     chat_factory = chat_orchestrator or _build_chat_orchestrator
 
     client = client_factory()
-    discovery = source_factory(client, settings)
     browser_service = browser_factory(settings)
     imagine_pipeline = imagine_factory(settings)
     convex = (
@@ -138,7 +128,7 @@ def create_app(
         else None
     )
     supermemory = SupermemoryClient(settings.supermemory_api_key) if settings.supermemory_api_key else None
-    jobs = job_factory(settings, client, ws_manager, discovery, browser_service, imagine_pipeline)
+    jobs = job_factory(settings, client, ws_manager, browser_service, imagine_pipeline)
     chat = chat_factory(settings, jobs, ws_manager)
     if isinstance(chat, ChatOrchestrator):
         chat.configure_integrations(convex_client=convex, supermemory_client=supermemory)
@@ -146,13 +136,22 @@ def create_app(
     app.state.settings = settings
     app.state.http_client = client
     app.state.websocket_manager = ws_manager
-    app.state.source_discovery = discovery
     app.state.browser_use = browser_service
     app.state.imagine_service = imagine_pipeline
     app.state.job_manager = jobs
     app.state.chat_orchestrator = chat
     app.state.convex = convex
     app.state.supermemory = supermemory
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(request: Request, exc: RequestValidationError):
+        logger.warning(
+            "Request validation failed path=%s errors=%s body=%s",
+            request.url.path,
+            exc.errors(),
+            exc.body,
+        )
+        return await request_validation_exception_handler(request, exc)
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:

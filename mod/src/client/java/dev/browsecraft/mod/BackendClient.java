@@ -60,6 +60,7 @@ public final class BackendClient implements BuildBackend {
         this.toolRequestHandler = Objects.requireNonNull(toolRequestHandler, "toolRequestHandler");
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
+                .version(HttpClient.Version.HTTP_1_1)
                 .build();
         this.reconnectExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "browsecraft-backend-ws");
