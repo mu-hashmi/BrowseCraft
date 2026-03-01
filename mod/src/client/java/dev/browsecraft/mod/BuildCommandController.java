@@ -3,7 +3,6 @@ package dev.browsecraft.mod;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executor;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -15,8 +14,7 @@ public final class BuildCommandController implements BuildBackendListener {
     private final Executor workerExecutor;
     private final Consumer<String> statusSink;
     private final Supplier<String> worldIdSupplier;
-    private final AtomicReference<String> activeJobId = new AtomicReference<>();
-    private final AtomicReference<String> activeSessionId = new AtomicReference<>();
+    private String activeSessionId;
 
     public BuildCommandController(
             String clientId,
@@ -37,42 +35,6 @@ public final class BuildCommandController implements BuildBackendListener {
         this.backend.connect(this);
     }
 
-    public void submit(String query) {
-        statusSink.accept("searching...");
-        workerExecutor.execute(() -> {
-            try {
-                String jobId = backend.submitBuildQuery(query, clientId);
-                activeJobId.set(jobId);
-            } catch (Exception error) {
-                mainExecutor.execute(() -> statusSink.accept("build submit failed: " + error.getMessage()));
-            }
-        });
-    }
-
-    public void submitImagine(String prompt) {
-        statusSink.accept("generating image...");
-        workerExecutor.execute(() -> {
-            try {
-                String jobId = backend.submitImaginePrompt(prompt, clientId);
-                activeJobId.set(jobId);
-            } catch (Exception error) {
-                mainExecutor.execute(() -> statusSink.accept("imagine submit failed: " + error.getMessage()));
-            }
-        });
-    }
-
-    public void submitImagineModify(String prompt) {
-        statusSink.accept("editing image...");
-        workerExecutor.execute(() -> {
-            try {
-                String jobId = backend.submitImagineModifyPrompt(prompt, clientId);
-                activeJobId.set(jobId);
-            } catch (Exception error) {
-                mainExecutor.execute(() -> statusSink.accept("imagine modify failed: " + error.getMessage()));
-            }
-        });
-    }
-
     public void submitChat(String message) {
         submitChat(message, null);
     }
@@ -86,16 +48,16 @@ public final class BuildCommandController implements BuildBackendListener {
             return;
         }
 
-        String sessionId = explicitSessionId;
-        if (sessionId == null || sessionId.isBlank()) {
-            sessionId = activeSessionId.get();
+        String sessionIdForRequest = explicitSessionId;
+        if (sessionIdForRequest == null || sessionIdForRequest.isBlank()) {
+            sessionIdForRequest = activeSessionId;
         }
-        String sessionIdForRequest = sessionId;
+        String finalSessionIdForRequest = sessionIdForRequest;
 
         statusSink.accept("thinking...");
         workerExecutor.execute(() -> {
             try {
-                backend.submitChatMessage(message, clientId, worldId, sessionIdForRequest);
+                backend.submitChatMessage(message, clientId, worldId, finalSessionIdForRequest);
             } catch (Exception error) {
                 mainExecutor.execute(() -> statusSink.accept("chat submit failed: " + error.getMessage()));
             }
@@ -115,7 +77,7 @@ public final class BuildCommandController implements BuildBackendListener {
         workerExecutor.execute(() -> {
             try {
                 String sessionId = backend.createSession(clientId, worldId);
-                activeSessionId.set(sessionId);
+                activeSessionId = sessionId;
                 String message = "active session: " + sessionId;
                 mainExecutor.execute(() -> statusSink.accept(message));
             } catch (Exception error) {
@@ -137,14 +99,13 @@ public final class BuildCommandController implements BuildBackendListener {
         workerExecutor.execute(() -> {
             try {
                 List<String> sessions = backend.listSessions(clientId, worldId);
-                String active = activeSessionId.get();
                 String message;
                 if (sessions.isEmpty()) {
                     message = "No sessions";
                 } else {
                     List<String> rendered = new ArrayList<>(sessions.size());
                     for (String sessionId : sessions) {
-                        if (sessionId.equals(active)) {
+                        if (sessionId.equals(activeSessionId)) {
                             rendered.add("*" + sessionId);
                         } else {
                             rendered.add(sessionId);
@@ -173,7 +134,7 @@ public final class BuildCommandController implements BuildBackendListener {
         workerExecutor.execute(() -> {
             try {
                 backend.switchSession(clientId, worldId, sessionId);
-                activeSessionId.set(sessionId);
+                activeSessionId = sessionId;
                 mainExecutor.execute(() -> statusSink.accept("active session: " + sessionId));
             } catch (Exception error) {
                 mainExecutor.execute(() -> statusSink.accept("session switch failed: " + error.getMessage()));
@@ -187,19 +148,7 @@ public final class BuildCommandController implements BuildBackendListener {
     }
 
     @Override
-    public void onReady(String jobId, String sourceType, String sourceUrl, double confidence, BuildPlan plan) {
-        activeJobId.compareAndSet(jobId, null);
-        mainExecutor.execute(() -> {
-            overlayState.setPlan(plan);
-            statusSink.accept("ready from " + sourceType + " (" + plan.totalBlocks() + " blocks)");
-        });
-    }
-
-    @Override
     public void onError(String jobId, String code, String message) {
-        if (jobId != null && !jobId.isEmpty()) {
-            activeJobId.compareAndSet(jobId, null);
-        }
         mainExecutor.execute(() -> statusSink.accept(code + ": " + message));
     }
 }

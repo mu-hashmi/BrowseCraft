@@ -9,16 +9,15 @@ import pytest
 
 from browsecraft_backend.chat_orchestrator import CHAT_MODEL, ChatOrchestrator
 from browsecraft_backend.convex_client import ConvexHttpClient
-from browsecraft_backend.models import BuildJobCreated, BuildRequest, ImagineRequest
 from browsecraft_backend.supermemory_client import SupermemoryProfileContext, SupermemorySearchResult
 
 
 EXPECTED_TOOL_NAMES = {
-    "search_schematics",
-    "generate_structure",
     "player_position",
     "player_inventory",
     "inspect_area",
+    "place_blocks",
+    "undo_last",
     "get_active_overlay",
     "modify_overlay",
     "get_blueprints",
@@ -46,20 +45,6 @@ class FakeAnthropicClient:
 
     async def close(self) -> None:
         self.closed = True
-
-
-class FakeJobManager:
-    def __init__(self) -> None:
-        self.build_requests: list[BuildRequest] = []
-        self.imagine_requests: list[ImagineRequest] = []
-
-    async def create_job(self, request: BuildRequest) -> BuildJobCreated:
-        self.build_requests.append(request)
-        return BuildJobCreated(job_id="job-search", status="queued")
-
-    async def create_imagine_job(self, request: ImagineRequest) -> BuildJobCreated:
-        self.imagine_requests.append(request)
-        return BuildJobCreated(job_id="job-imagine", status="queued")
 
 
 class FakeWebSocketManager:
@@ -171,33 +156,42 @@ def _text_response(text: str) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_search_tool_routes_to_job_manager_and_emits_chat_response() -> None:
+async def test_place_blocks_tool_routes_through_websocket_manager_and_emits_chat_response() -> None:
     anthropic_client = FakeAnthropicClient(
         responses=[
             _tool_use_response(
-                "search_schematics",
-                {"query": "starter house"},
+                "place_blocks",
+                {
+                    "placements": [
+                        {"x": 10, "y": 64, "z": 20, "block_id": "minecraft:stone"},
+                        {"x": 11, "y": 64, "z": 20, "block_id": "minecraft:stone"},
+                    ]
+                },
             ),
-            _text_response("Queued a schematic search."),
+            _text_response("Placed blocks."),
         ]
     )
-    jobs = FakeJobManager()
     ws = FakeWebSocketManager()
     orchestrator = ChatOrchestrator(
         anthropic_api_key="test-key",
-        job_manager=jobs,
         websocket_manager=ws,
         anthropic_client_factory=lambda api_key: anthropic_client,
     )
 
-    await orchestrator._run_chat(chat_id="chat-1", client_id="client-1", user_message="build me a house")
+    await orchestrator._run_chat(chat_id="chat-1", client_id="client-1", user_message="build a short wall")
 
-    assert len(jobs.build_requests) == 1
-    assert jobs.build_requests[0].query == "starter house"
-    assert jobs.build_requests[0].mc_version == "1.21.11"
-    assert jobs.build_requests[0].client_id == "client-1"
-    assert jobs.imagine_requests == []
-    assert ws.tool_requests == []
+    assert ws.tool_requests == [
+        (
+            "client-1",
+            "place_blocks",
+            {
+                "placements": [
+                    {"x": 10, "y": 64, "z": 20, "block_id": "minecraft:stone"},
+                    {"x": 11, "y": 64, "z": 20, "block_id": "minecraft:stone"},
+                ]
+            },
+        )
+    ]
 
     first_call = anthropic_client.messages.calls[0]
     assert first_call["model"] == CHAT_MODEL
@@ -206,35 +200,8 @@ async def test_search_tool_routes_to_job_manager_and_emits_chat_response() -> No
     assert ws.sent_payloads[0][0] == "client-1"
     assert ws.sent_payloads[0][1]["type"] == "chat.response"
     assert ws.sent_payloads[0][1]["chat_id"] == "chat-1"
-    assert ws.sent_payloads[0][1]["payload"]["message"] == "Queued a schematic search."
+    assert ws.sent_payloads[0][1]["payload"]["message"] == "Placed blocks."
     assert anthropic_client.closed is True
-
-
-@pytest.mark.asyncio
-async def test_generate_tool_routes_to_imagine_job_manager() -> None:
-    anthropic_client = FakeAnthropicClient(
-        responses=[
-            _tool_use_response("generate_structure", {"prompt": "tiny oak cabin"}),
-            _text_response("Started an imagine job."),
-        ]
-    )
-    jobs = FakeJobManager()
-    ws = FakeWebSocketManager()
-    orchestrator = ChatOrchestrator(
-        anthropic_api_key="test-key",
-        job_manager=jobs,
-        websocket_manager=ws,
-        anthropic_client_factory=lambda api_key: anthropic_client,
-    )
-
-    await orchestrator._run_chat(chat_id="chat-2", client_id="client-2", user_message="imagine me a cabin")
-
-    assert len(jobs.imagine_requests) == 1
-    assert jobs.imagine_requests[0].prompt == "tiny oak cabin"
-    assert jobs.imagine_requests[0].client_id == "client-2"
-    assert jobs.build_requests == []
-    assert ws.tool_requests == []
-    assert ws.sent_payloads[0][1]["payload"]["message"] == "Started an imagine job."
 
 
 @pytest.mark.asyncio
@@ -248,26 +215,22 @@ async def test_world_tool_routes_through_websocket_manager() -> None:
             _text_response("Area inspected."),
         ]
     )
-    jobs = FakeJobManager()
     ws = FakeWebSocketManager()
     orchestrator = ChatOrchestrator(
         anthropic_api_key="test-key",
-        job_manager=jobs,
         websocket_manager=ws,
         anthropic_client_factory=lambda api_key: anthropic_client,
     )
 
-    await orchestrator._run_chat(chat_id="chat-3", client_id="client-3", user_message="scan nearby blocks")
+    await orchestrator._run_chat(chat_id="chat-2", client_id="client-2", user_message="scan nearby blocks")
 
     assert ws.tool_requests == [
         (
-            "client-3",
+            "client-2",
             "inspect_area",
             {"center": {"x": 10, "y": 64, "z": 20}, "radius": 4},
         )
     ]
-    assert jobs.build_requests == []
-    assert jobs.imagine_requests == []
     assert ws.sent_payloads[0][1]["payload"]["message"] == "Area inspected."
 
 
@@ -279,16 +242,14 @@ async def test_invalid_tool_args_are_reported_back_to_model() -> None:
             _text_response("Please provide center coordinates."),
         ]
     )
-    jobs = FakeJobManager()
     ws = FakeWebSocketManager()
     orchestrator = ChatOrchestrator(
         anthropic_api_key="test-key",
-        job_manager=jobs,
         websocket_manager=ws,
         anthropic_client_factory=lambda api_key: anthropic_client,
     )
 
-    await orchestrator._run_chat(chat_id="chat-4", client_id="client-4", user_message="inspect around me")
+    await orchestrator._run_chat(chat_id="chat-3", client_id="client-3", user_message="inspect around me")
 
     second_call = anthropic_client.messages.calls[1]
     tool_result = second_call["messages"][-1]["content"][0]
@@ -297,18 +258,14 @@ async def test_invalid_tool_args_are_reported_back_to_model() -> None:
     assert tool_result["is_error"] is True
     assert "Invalid arguments for inspect_area" in tool_result["content"]
     assert ws.tool_requests == []
-    assert jobs.build_requests == []
-    assert jobs.imagine_requests == []
     assert ws.sent_payloads[0][1]["payload"]["message"] == "Please provide center coordinates."
 
 
 @pytest.mark.asyncio
 async def test_session_lifecycle_works_with_in_memory_store() -> None:
-    jobs = FakeJobManager()
     ws = FakeWebSocketManager()
     orchestrator = ChatOrchestrator(
         anthropic_api_key="test-key",
-        job_manager=jobs,
         websocket_manager=ws,
         anthropic_client_factory=lambda api_key: FakeAnthropicClient([_text_response("unused")]),
     )
@@ -352,18 +309,16 @@ async def test_explicit_session_override_uses_requested_convex_session() -> None
     }
 
     anthropic_client = FakeAnthropicClient([_text_response("latest assistant")])
-    jobs = FakeJobManager()
     ws = FakeWebSocketManager()
     orchestrator = ChatOrchestrator(
         anthropic_api_key="test-key",
-        job_manager=jobs,
         websocket_manager=ws,
         anthropic_client_factory=lambda api_key: anthropic_client,
         convex_client=convex,
     )
 
     await orchestrator._run_chat(
-        chat_id="chat-5",
+        chat_id="chat-4",
         client_id="client-1",
         user_message="new question",
         world_id="world-1",
@@ -390,8 +345,11 @@ async def test_explicit_session_override_uses_requested_convex_session() -> None
 async def test_supermemory_is_used_for_context_and_meaningful_tool_outcomes() -> None:
     anthropic_client = FakeAnthropicClient(
         responses=[
-            _tool_use_response("search_schematics", {"query": "oak starter base"}),
-            _text_response("Queued it."),
+            _tool_use_response(
+                "place_blocks",
+                {"placements": [{"x": 0, "y": 64, "z": 0, "block_id": "minecraft:oak_planks"}]},
+            ),
+            _text_response("Placed it."),
         ]
     )
     supermemory = FakeSupermemoryClient(
@@ -401,17 +359,15 @@ async def test_supermemory_is_used_for_context_and_meaningful_tool_outcomes() ->
             dynamic=("Currently building with oak and stone.",),
         ),
     )
-    jobs = FakeJobManager()
     ws = FakeWebSocketManager()
     orchestrator = ChatOrchestrator(
         anthropic_api_key="test-key",
-        job_manager=jobs,
         websocket_manager=ws,
         anthropic_client_factory=lambda api_key: anthropic_client,
         supermemory_client=supermemory,
     )
 
-    await orchestrator._run_chat(chat_id="chat-6", client_id="client-6", user_message="build something")
+    await orchestrator._run_chat(chat_id="chat-5", client_id="client-6", user_message="build something")
 
     first_call = anthropic_client.messages.calls[0]
     assert "Relevant long-term memory" in first_call["system"]
@@ -428,4 +384,4 @@ async def test_supermemory_is_used_for_context_and_meaningful_tool_outcomes() ->
     ]
     assert len(supermemory.store_calls) == 1
     assert supermemory.store_calls[0]["container_tag"] == "default:client-6"
-    assert supermemory.store_calls[0]["metadata"]["tool"] == "search_schematics"
+    assert supermemory.store_calls[0]["metadata"]["tool"] == "place_blocks"

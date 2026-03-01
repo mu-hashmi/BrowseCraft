@@ -16,7 +16,6 @@ import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -34,13 +33,11 @@ public final class BackendClient implements BuildBackend {
     private static final long RECONNECT_MAX_DELAY_MS = 30_000;
 
     private final BackendEndpoints endpoints;
-    private final String mcVersion;
     private final HttpClient httpClient;
     private final Gson gson = new Gson();
     private final ScheduledExecutorService reconnectExecutor;
     private final AtomicInteger reconnectAttempts = new AtomicInteger();
     private final AtomicLong connectionGeneration = new AtomicLong();
-    private final AtomicReference<String> activeJobId = new AtomicReference<>();
     private final ToolRequestHandler toolRequestHandler;
 
     private volatile BuildBackendListener listener;
@@ -56,7 +53,6 @@ public final class BackendClient implements BuildBackend {
 
     public BackendClient(BackendEndpoints endpoints, String mcVersion, ToolRequestHandler toolRequestHandler) {
         this.endpoints = endpoints;
-        this.mcVersion = mcVersion;
         this.toolRequestHandler = Objects.requireNonNull(toolRequestHandler, "toolRequestHandler");
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
@@ -75,31 +71,6 @@ public final class BackendClient implements BuildBackend {
         this.closed = false;
         long generation = this.connectionGeneration.incrementAndGet();
         openWebSocket(generation);
-    }
-
-    @Override
-    public String submitBuildQuery(String query, String clientId) throws IOException, InterruptedException {
-        JsonObject requestBody = new JsonObject();
-        requestBody.addProperty("query", query);
-        requestBody.addProperty("mc_version", mcVersion);
-        requestBody.addProperty("client_id", clientId);
-        return submitJobRequest("/v1/jobs", requestBody);
-    }
-
-    @Override
-    public String submitImaginePrompt(String prompt, String clientId) throws IOException, InterruptedException {
-        JsonObject requestBody = new JsonObject();
-        requestBody.addProperty("prompt", prompt);
-        requestBody.addProperty("client_id", clientId);
-        return submitJobRequest("/v1/imagine", requestBody);
-    }
-
-    @Override
-    public String submitImagineModifyPrompt(String prompt, String clientId) throws IOException, InterruptedException {
-        JsonObject requestBody = new JsonObject();
-        requestBody.addProperty("prompt", prompt);
-        requestBody.addProperty("client_id", clientId);
-        return submitJobRequest("/v1/imagine/modify", requestBody);
     }
 
     @Override
@@ -163,14 +134,6 @@ public final class BackendClient implements BuildBackend {
         requestBody.addProperty("world_id", worldId);
         requestBody.addProperty("session_id", sessionId);
         postJson("/v1/session/switch", requestBody);
-    }
-
-    private String submitJobRequest(String endpoint, JsonObject requestBody) throws IOException, InterruptedException {
-        HttpResponse<String> response = postJson(endpoint, requestBody);
-        JsonObject payload = JsonParser.parseString(response.body()).getAsJsonObject();
-        String jobId = payload.get("job_id").getAsString();
-        activeJobId.set(jobId);
-        return jobId;
     }
 
     private HttpResponse<String> postJson(String endpoint, JsonObject requestBody) throws IOException, InterruptedException {
@@ -260,8 +223,7 @@ public final class BackendClient implements BuildBackend {
 
         long delay = backoffDelayMillis(reconnectAttempts.getAndIncrement());
         BuildBackendListener currentListener = listener;
-        boolean hasActiveJob = activeJobId.get() != null;
-        if (currentListener != null && (seenSuccessfulConnection || hasActiveJob)) {
+        if (currentListener != null && seenSuccessfulConnection) {
             currentListener.onError("", "WS_DISCONNECTED", error.getMessage());
         }
 
@@ -282,45 +244,6 @@ public final class BackendClient implements BuildBackend {
         return Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * exponent);
     }
 
-    private void handleEventMessage(JsonObject event) {
-        BuildBackendListener currentListener = listener;
-        if (currentListener == null) {
-            return;
-        }
-
-        String type = event.get("type").getAsString();
-        String jobId = event.get("job_id").getAsString();
-        JsonObject payload = event.getAsJsonObject("payload");
-
-        switch (type) {
-            case "job.status" -> {
-                String stage = payload.get("stage").getAsString();
-                String text = payload.get("message").getAsString();
-                currentListener.onStatus(jobId, stage, text);
-            }
-            case "job.ready" -> {
-                JsonObject source = payload.getAsJsonObject("source");
-                String sourceType = source.get("type").getAsString();
-                String sourceUrl = source.get("url").getAsString();
-                double confidence = payload.get("confidence").getAsDouble();
-                BuildPlan plan = parsePlan(payload.getAsJsonObject("plan"));
-                activeJobId.compareAndSet(jobId, null);
-                currentListener.onReady(jobId, sourceType, sourceUrl, confidence, plan);
-            }
-            case "job.error" -> {
-                String code = payload.get("code").getAsString();
-                String text = payload.get("message").getAsString();
-                if (code.startsWith("WS_") && activeJobId.get() == null) {
-                    return;
-                }
-                activeJobId.compareAndSet(jobId, null);
-                currentListener.onError(jobId, code, text);
-            }
-            default -> {
-            }
-        }
-    }
-
     private void handleIncomingMessage(WebSocket socket, String message) {
         JsonObject envelope = JsonParser.parseString(message).getAsJsonObject();
         String type = requiredString(envelope, "type");
@@ -336,7 +259,6 @@ public final class BackendClient implements BuildBackend {
             handleToolRequest(socket, envelope);
             return;
         }
-        handleEventMessage(envelope);
     }
 
     private void handleChatResponse(JsonObject envelope) {
@@ -428,32 +350,6 @@ public final class BackendClient implements BuildBackend {
             return error;
         }
         return error.getCause();
-    }
-
-    private BuildPlan parsePlan(JsonObject planObject) {
-        int totalBlocks = planObject.get("total_blocks").getAsInt();
-        List<BuildPlacement> placements = new ArrayList<>();
-
-        for (JsonElement placementElement : planObject.getAsJsonArray("placements")) {
-            JsonObject placementObject = placementElement.getAsJsonObject();
-            JsonObject blockStateObject = placementObject.getAsJsonObject("block_state");
-            Map<String, String> blockState = new HashMap<>();
-            if (blockStateObject != null) {
-                for (Map.Entry<String, JsonElement> entry : blockStateObject.entrySet()) {
-                    blockState.put(entry.getKey(), entry.getValue().getAsString());
-                }
-            }
-
-            placements.add(new BuildPlacement(
-                    placementObject.get("dx").getAsInt(),
-                    placementObject.get("dy").getAsInt(),
-                    placementObject.get("dz").getAsInt(),
-                    placementObject.get("block_id").getAsString(),
-                    Map.copyOf(blockState)
-            ));
-        }
-
-        return new BuildPlan(totalBlocks, List.copyOf(placements));
     }
 
     private final class SocketListener implements WebSocket.Listener {

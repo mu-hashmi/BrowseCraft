@@ -1,16 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Literal
-from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-
-
-JobStage = Literal["queued", "searching", "normalizing", "ready", "failed"]
-SourceType = Literal["browser_use", "imagine"]
-EventType = Literal["job.status", "job.ready", "job.error"]
 
 
 _REQUIRED_BLOCK_IDS = {
@@ -81,22 +74,6 @@ class BuildPlan(BaseModel):
     placements: list[BlockPlacement]
 
 
-class BuildRequest(BaseModel):
-    query: str = Field(min_length=1)
-    mc_version: str = Field(min_length=1)
-    client_id: str = Field(min_length=1)
-
-
-class ImagineRequest(BaseModel):
-    prompt: str = Field(min_length=1)
-    client_id: str = Field(min_length=1)
-
-
-class ImagineModifyRequest(BaseModel):
-    prompt: str = Field(min_length=1)
-    client_id: str = Field(min_length=1)
-
-
 class ChatRequest(BaseModel):
     client_id: str = Field(min_length=1)
     message: str = Field(min_length=1)
@@ -143,87 +120,3 @@ class SessionListResponse(BaseModel):
     world_id: str
     active_session_id: str | None = None
     sessions: list[SessionSummary]
-
-
-class BuildJobCreated(BaseModel):
-    job_id: str
-    status: JobStage
-
-
-class SourceInfo(BaseModel):
-    type: SourceType
-    url: str
-
-
-class JobReadyPayload(BaseModel):
-    source: SourceInfo
-    confidence: float = Field(ge=0.0, le=1.0)
-    plan: BuildPlan
-
-
-class JobStatusPayload(BaseModel):
-    stage: JobStage
-    message: str
-
-
-class JobErrorPayload(BaseModel):
-    code: str
-    message: str
-
-
-class EventEnvelope(BaseModel):
-    type: EventType
-    job_id: str
-    payload: dict[str, Any]
-
-
-class JobStatusResponse(BaseModel):
-    job_id: str
-    stage: JobStage
-    message: str
-    source: SourceInfo | None = None
-    confidence: float | None = None
-    plan: BuildPlan | None = None
-    error_code: str | None = None
-    error_message: str | None = None
-
-
-@dataclass(slots=True)
-class JobState:
-    query: str
-    mc_version: str
-    client_id: str
-    job_id: str = field(default_factory=lambda: str(uuid4()))
-    stage: JobStage = "queued"
-    message: str = "queued"
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    source: SourceInfo | None = None
-    confidence: float | None = None
-    plan: BuildPlan | None = None
-    error_code: str | None = None
-    error_message: str | None = None
-
-    def set_stage(self, stage: JobStage, message: str) -> None:
-        self.stage = stage
-        self.message = message
-        self.updated_at = datetime.now(UTC)
-
-    def set_error(self, code: str, message: str) -> None:
-        self.stage = "failed"
-        self.message = message
-        self.error_code = code
-        self.error_message = message
-        self.updated_at = datetime.now(UTC)
-
-    def as_response(self) -> JobStatusResponse:
-        return JobStatusResponse(
-            job_id=self.job_id,
-            stage=self.stage,
-            message=self.message,
-            source=self.source,
-            confidence=self.confidence,
-            plan=self.plan,
-            error_code=self.error_code,
-            error_message=self.error_message,
-        )

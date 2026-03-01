@@ -7,8 +7,6 @@ from uuid import uuid4
 
 from fastapi import WebSocket
 
-from .models import EventEnvelope
-
 
 @dataclass(slots=True)
 class PendingToolRequest:
@@ -39,10 +37,6 @@ class WebSocketManager:
                 pending = self._pending_tool_requests.pop(request_id)
                 if not pending.future.done():
                     pending.future.set_exception(ConnectionError(f"WebSocket disconnected for client {client_id}"))
-
-    async def send(self, client_id: str, event: EventEnvelope) -> None:
-        websocket = self._connections[client_id]
-        await websocket.send_json(event.model_dump())
 
     async def send_payload(self, client_id: str, payload: dict[str, Any]) -> None:
         websocket = self._connections[client_id]

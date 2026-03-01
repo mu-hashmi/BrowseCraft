@@ -1,15 +1,13 @@
 ![BrowseCraft Header](docs/header.svg)
 
-BrowseCraft is a hackathon prototype that lets players search for real schematics, generate new Minecraft structures from text prompts, and iteratively modify builds through an in-game chat agent, all without leaving Minecraft.
+BrowseCraft is a hackathon prototype focused on one interface: `/chat`. The in-game agent inspects the world, reasons about space, and places blocks directly through tool calls.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  A["Minecraft + Fabric Mod"] -->|"/build, /imagine, /chat, /session"| B["FastAPI Backend"]
-  B -->|search/download + parse schematics| C["GitHub/Modrinth/CurseForge + Browser-Use"]
-  B -->|image generation| D["Gemini image model"]
-  B -->|vision + reasoning + tool use| E["Claude Sonnet 4"]
+  A["Minecraft + Fabric Mod"] -->|"/chat, /session"| B["FastAPI Backend"]
+  B -->|tool use + reasoning| E["Claude Opus 4.6"]
   B <-->|tool.request / tool.response| A
   B -->|sessions + blueprints persistence| F["Convex (optional)"]
   B -->|long-term memory retrieval/store| G["Supermemory (optional)"]
@@ -38,33 +36,8 @@ flowchart LR
 
 ## Demo Commands
 
-- `/build <query>`
-- `/imagine <prompt>`
-- `/imagine modify <prompt>`
 - `/chat <message>`
 - `/blueprints save|load|list`
 - `/materials`
 - `/session new|list|switch <id>`
 - `/build-test` (fallback demo path)
-
-## Browser Use Optimization Workflow
-
-1. Create or reuse a dedicated PlanetMinecraft skill.
-   ```bash
-   cd ~/BrowseCraft/backend
-   uv run python scripts/create_planet_minecraft_skill.py
-   ```
-2. Create or reuse a Browser Use profile for cookie/session reuse.
-   ```bash
-   cd ~/BrowseCraft/backend
-   uv run python scripts/create_browser_profile.py
-   ```
-3. Sync your local browser state into the created cloud profile and accept PlanetMinecraft cookies once.
-   ```bash
-   curl -fsSL https://browser-use.com/profile.sh | BROWSER_USE_API_KEY=... PROFILE_ID=... sh
-   ```
-4. Benchmark Browser Use models for your workload and keep the fastest one as `BROWSER_USE_PRIMARY_LLM`.
-   ```bash
-   cd ~/BrowseCraft/backend
-   uv run python scripts/benchmark_browser_use_models.py --runs 2
-   ```

@@ -6,12 +6,6 @@ import java.util.List;
 public interface BuildBackend {
     void connect(BuildBackendListener listener);
 
-    String submitBuildQuery(String query, String clientId) throws IOException, InterruptedException;
-
-    String submitImaginePrompt(String prompt, String clientId) throws IOException, InterruptedException;
-
-    String submitImagineModifyPrompt(String prompt, String clientId) throws IOException, InterruptedException;
-
     void submitChatMessage(
             String message,
             String clientId,

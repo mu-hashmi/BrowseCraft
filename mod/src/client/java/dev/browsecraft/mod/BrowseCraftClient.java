@@ -62,8 +62,11 @@ public final class BrowseCraftClient implements ClientModInitializer {
     private ExecutorService workerExecutor;
     private String clientId;
     private final WorldIdResolver worldIdResolver = new WorldIdResolver();
+    private boolean hasUndoState;
+    private boolean undoClearsOverlay;
+    private OverlayState.BlueprintState undoBlueprintState;
 
-    private KeyBinding openBuildKey;
+    private KeyBinding openChatKey;
     private KeyBinding rotateKey;
     private KeyBinding shiftUpKey;
     private KeyBinding shiftDownKey;
@@ -73,9 +76,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
     private int buildTestCaptureTicksRemaining = -1;
     private int inventoryPollCountdown;
-    private volatile boolean captureArtifactsOnNextReady;
     private volatile String latestStatusMessage = "";
-    private volatile String latestReadySourceType = "";
 
     @Override
     public void onInitializeClient() {
@@ -89,14 +90,6 @@ public final class BrowseCraftClient implements ClientModInitializer {
         Executor mainExecutor = runnable -> MinecraftClient.getInstance().execute(runnable);
         Consumer<String> statusSink = message -> {
             latestStatusMessage = message;
-            String readySource = parseReadySourceType(message);
-            if (!readySource.isEmpty()) {
-                latestReadySourceType = readySource;
-                if (captureArtifactsOnNextReady) {
-                    captureArtifactsOnNextReady = false;
-                    buildTestCaptureTicksRemaining = 5;
-                }
-            }
             MinecraftClient client = MinecraftClient.getInstance();
             if (client.player != null) {
                 client.player.sendMessage(Text.literal(message), true);
@@ -121,8 +114,8 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
     private void registerKeyBindings() {
         this.keyCategory = KeyBinding.Category.create(Identifier.of("browsecraft", "controls"));
-        this.openBuildKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
-                "key.browsecraft.open_build",
+        this.openChatKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.browsecraft.open_chat",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_G,
                 keyCategory
@@ -161,34 +154,11 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
     private void registerCommands() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
-            dispatcher.register(literal("build")
-                    .then(argument("query", StringArgumentType.greedyString())
-                            .executes(context -> {
-                                String query = StringArgumentType.getString(context, "query");
-                                commandController.submit(query);
-                                return 1;
-                            })));
-
             dispatcher.register(literal("build-test")
                     .executes(context -> {
                         runBuildTestCommand(MinecraftClient.getInstance());
                         return 1;
                     }));
-
-            dispatcher.register(literal("imagine")
-                    .then(literal("modify")
-                            .then(argument("prompt", StringArgumentType.greedyString())
-                                    .executes(context -> {
-                                        String prompt = StringArgumentType.getString(context, "prompt");
-                                        commandController.submitImagineModify(prompt);
-                                        return 1;
-                                    })))
-                    .then(argument("prompt", StringArgumentType.greedyString())
-                            .executes(context -> {
-                                String prompt = StringArgumentType.getString(context, "prompt");
-                                commandController.submitImagine(prompt);
-                                return 1;
-                            })));
 
             dispatcher.register(literal("chat")
                     .then(argument("message", StringArgumentType.greedyString())
@@ -240,8 +210,8 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
     private void registerClientTick() {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            if (openBuildKey.wasPressed()) {
-                client.setScreen(new ChatScreen("/build ", false));
+            if (openChatKey.wasPressed()) {
+                client.setScreen(new ChatScreen("/chat ", false));
             }
 
             if (client.player == null || client.world == null) {
@@ -309,11 +279,6 @@ public final class BrowseCraftClient implements ClientModInitializer {
         overlayState.setRotationQuarterTurns(rotationForFacing(client.player.getHorizontalFacing()));
         buildTestCaptureTicksRemaining = 5;
         client.player.sendMessage(Text.literal("Loaded /build-test plan"), true);
-    }
-
-    private void runBuildQueryForArtifacts(String query) {
-        captureArtifactsOnNextReady = true;
-        commandController.submit(query);
     }
 
     private BuildPlan createBuildTestPlan() {
@@ -517,7 +482,6 @@ public final class BrowseCraftClient implements ClientModInitializer {
             root.add("validation", validationToJson(snapshot));
             JsonObject backend = new JsonObject();
             backend.addProperty("latest_status_message", latestStatusMessage);
-            backend.addProperty("latest_ready_source_type", latestReadySourceType);
             root.add("backend", backend);
 
             JsonObject renderStatus = new JsonObject();
@@ -608,6 +572,8 @@ public final class BrowseCraftClient implements ClientModInitializer {
             case "player_position" -> toolPlayerPosition(client);
             case "player_inventory" -> toolPlayerInventory(client);
             case "inspect_area" -> toolInspectArea(client, params);
+            case "place_blocks" -> toolPlaceBlocks(params);
+            case "undo_last" -> toolUndoLast();
             case "get_active_overlay" -> activeOverlaySummary(overlayState.snapshot());
             case "modify_overlay" -> toolModifyOverlay(params);
             case "get_blueprints" -> toolGetBlueprints(client);
@@ -707,6 +673,91 @@ public final class BrowseCraftClient implements ClientModInitializer {
         result.addProperty("sampled_blocks", sampledBlocks);
         result.add("center", blockPosToJson(center));
         result.add("block_counts", countsJson);
+        return result;
+    }
+
+    private JsonObject toolPlaceBlocks(JsonObject params) {
+        JsonElement placementsElement = params.get("placements");
+        if (placementsElement == null || !placementsElement.isJsonArray()) {
+            throw new IllegalArgumentException("Expected array field: placements");
+        }
+        JsonArray placementsJson = placementsElement.getAsJsonArray();
+        if (placementsJson.isEmpty()) {
+            throw new IllegalArgumentException("placements must contain at least one block");
+        }
+
+        List<AbsolutePlacement> absolutePlacements = new ArrayList<>(placementsJson.size());
+        int anchorX = Integer.MAX_VALUE;
+        int anchorY = Integer.MAX_VALUE;
+        int anchorZ = Integer.MAX_VALUE;
+
+        for (JsonElement element : placementsJson) {
+            if (!element.isJsonObject()) {
+                throw new IllegalArgumentException("placements must contain objects");
+            }
+            JsonObject placementJson = element.getAsJsonObject();
+            int x = requiredInt(placementJson, "x");
+            int y = requiredInt(placementJson, "y");
+            int z = requiredInt(placementJson, "z");
+            String blockId = normalizeBlockId(requiredString(placementJson, "block_id"));
+
+            absolutePlacements.add(new AbsolutePlacement(x, y, z, blockId));
+            anchorX = Math.min(anchorX, x);
+            anchorY = Math.min(anchorY, y);
+            anchorZ = Math.min(anchorZ, z);
+        }
+
+        if (overlayState.hasPlan()) {
+            undoBlueprintState = overlayState.blueprintState();
+            undoClearsOverlay = false;
+        } else {
+            undoBlueprintState = null;
+            undoClearsOverlay = true;
+        }
+        hasUndoState = true;
+
+        List<BuildPlacement> relativePlacements = new ArrayList<>(absolutePlacements.size());
+        for (AbsolutePlacement placement : absolutePlacements) {
+            relativePlacements.add(new BuildPlacement(
+                    placement.x() - anchorX,
+                    placement.y() - anchorY,
+                    placement.z() - anchorZ,
+                    placement.blockId(),
+                    Map.of()
+            ));
+        }
+
+        BuildPlan plan = new BuildPlan(relativePlacements.size(), List.copyOf(relativePlacements));
+        BlockPos anchor = new BlockPos(anchorX, anchorY, anchorZ);
+        overlayState.setPlan(plan);
+        overlayState.setAnchor(anchor);
+        overlayState.confirm();
+
+        JsonObject result = new JsonObject();
+        result.addProperty("placed_count", relativePlacements.size());
+        result.add("anchor", blockPosToJson(anchor));
+        result.add("overlay", activeOverlaySummary(overlayState.snapshot()));
+        return result;
+    }
+
+    private JsonObject toolUndoLast() {
+        if (!hasUndoState) {
+            throw new IllegalStateException("No placement batch to undo");
+        }
+
+        if (undoClearsOverlay) {
+            overlayState.cancel();
+        } else {
+            overlayState.loadBlueprint(undoBlueprintState);
+        }
+
+        hasUndoState = false;
+        undoClearsOverlay = false;
+        undoBlueprintState = null;
+
+        JsonObject result = new JsonObject();
+        result.addProperty("undone", true);
+        result.add("overlay", activeOverlaySummary(overlayState.snapshot()));
         return result;
     }
 
@@ -853,16 +904,12 @@ public final class BrowseCraftClient implements ClientModInitializer {
         return element.getAsInt();
     }
 
-    private String parseReadySourceType(String message) {
-        if (!message.startsWith("ready from ")) {
-            return "";
+    private String normalizeBlockId(String blockId) {
+        int stateStart = blockId.indexOf('[');
+        if (stateStart < 0) {
+            return blockId;
         }
-        int sourceStart = "ready from ".length();
-        int sourceEnd = message.indexOf(" (");
-        if (sourceEnd <= sourceStart) {
-            return "";
-        }
-        return message.substring(sourceStart, sourceEnd);
+        return blockId.substring(0, stateStart);
     }
 
     public static void onBuildTestCommand() {
@@ -870,13 +917,6 @@ public final class BrowseCraftClient implements ClientModInitializer {
             return;
         }
         instance.runBuildTestCommand(MinecraftClient.getInstance());
-    }
-
-    public static void onBuildQueryForArtifacts(String query) {
-        if (instance == null) {
-            return;
-        }
-        instance.runBuildQueryForArtifacts(query);
     }
 
     public static Path latestBuildTestJsonPath() {
@@ -894,10 +934,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
         return instance.latestStatusMessage;
     }
 
-    public static String latestReadySourceType() {
-        if (instance == null) {
-            return "";
-        }
-        return instance.latestReadySourceType;
+    private record AbsolutePlacement(int x, int y, int z, String blockId) {
     }
+
 }

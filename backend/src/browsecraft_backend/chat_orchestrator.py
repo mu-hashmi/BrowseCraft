@@ -13,12 +13,9 @@ from lmnr import observe
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from .convex_client import ConvexHttpClient
-from .job_manager import JobManager
 from .models import (
-    BuildRequest,
     ChatAcceptedResponse,
     ChatRequest,
-    ImagineRequest,
     SessionCreatedResponse,
     SessionListResponse,
     SessionSummary,
@@ -29,8 +26,7 @@ from .websocket_manager import WebSocketManager
 
 logger = logging.getLogger(__name__)
 
-CHAT_MODEL = "claude-sonnet-4-20250514"
-DEFAULT_MC_VERSION = "1.21.11"
+CHAT_MODEL = "claude-opus-4-6"
 _DEFAULT_WORLD_ID = "default"
 _SYSTEM_PROMPT = (
     "You are BrowseCraft's Minecraft in-game assistant.\n"
@@ -41,8 +37,8 @@ _SYSTEM_PROMPT = (
 _MAX_TOOL_ROUNDS = 12
 _CONTEXT_MESSAGE_LIMIT = 12
 _MEMORY_OUTCOME_TOOLS = {
-    "search_schematics",
-    "generate_structure",
+    "place_blocks",
+    "undo_last",
     "modify_overlay",
     "save_blueprint",
     "load_blueprint",
@@ -57,12 +53,11 @@ class _NoArgs(_ToolArgs):
     pass
 
 
-class _SearchSchematicsArgs(_ToolArgs):
-    query: str = Field(min_length=1)
-
-
-class _GenerateStructureArgs(_ToolArgs):
-    prompt: str = Field(min_length=1)
+class _PlaceBlockArgs(_ToolArgs):
+    x: int
+    y: int
+    z: int
+    block_id: str = Field(min_length=1)
 
 
 class _BlockPositionArgs(_ToolArgs):
@@ -74,6 +69,10 @@ class _BlockPositionArgs(_ToolArgs):
 class _InspectAreaArgs(_ToolArgs):
     center: _BlockPositionArgs
     radius: int = Field(ge=0, le=16)
+
+
+class _PlaceBlocksArgs(_ToolArgs):
+    placements: list[_PlaceBlockArgs] = Field(min_length=1)
 
 
 class _ModifyOverlayRotateArgs(_ToolArgs):
@@ -107,6 +106,24 @@ _ModifyOverlayUnion = Annotated[
     Field(discriminator="op"),
 ]
 _MODIFY_OVERLAY_ADAPTER = TypeAdapter(_ModifyOverlayUnion)
+_MODIFY_OVERLAY_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "op": {
+            "type": "string",
+            "enum": ["rotate", "shift", "set_anchor", "replace_block"],
+        },
+        "quarters": {"type": "integer"},
+        "dy": {"type": "integer"},
+        "x": {"type": "integer"},
+        "y": {"type": "integer"},
+        "z": {"type": "integer"},
+        "from": {"type": "string", "minLength": 1},
+        "to": {"type": "string", "minLength": 1},
+    },
+    "required": ["op"],
+    "additionalProperties": False,
+}
 
 
 class _BlueprintNameArgs(_ToolArgs):
@@ -176,16 +193,6 @@ class SupermemoryClientProtocol(Protocol):
 
 _TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
-        "name": "search_schematics",
-        "description": "Start a schematic search job from a user query.",
-        "input_schema": _SearchSchematicsArgs.model_json_schema(),
-    },
-    {
-        "name": "generate_structure",
-        "description": "Start an image-to-structure generation job from a prompt.",
-        "input_schema": _GenerateStructureArgs.model_json_schema(),
-    },
-    {
         "name": "player_position",
         "description": "Read current player position and facing.",
         "input_schema": _NoArgs.model_json_schema(),
@@ -201,6 +208,16 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
         "input_schema": _InspectAreaArgs.model_json_schema(),
     },
     {
+        "name": "place_blocks",
+        "description": "Place blocks at absolute world coordinates.",
+        "input_schema": _PlaceBlocksArgs.model_json_schema(),
+    },
+    {
+        "name": "undo_last",
+        "description": "Undo the most recent placement batch from place_blocks.",
+        "input_schema": _NoArgs.model_json_schema(),
+    },
+    {
         "name": "get_active_overlay",
         "description": "Read the active overlay state.",
         "input_schema": _NoArgs.model_json_schema(),
@@ -208,7 +225,7 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "modify_overlay",
         "description": "Modify overlay state with rotate, shift, set_anchor, or replace_block operations.",
-        "input_schema": _MODIFY_OVERLAY_ADAPTER.json_schema(),
+        "input_schema": _MODIFY_OVERLAY_TOOL_SCHEMA,
     },
     {
         "name": "get_blueprints",
@@ -232,7 +249,6 @@ class ChatOrchestrator:
     def __init__(
         self,
         anthropic_api_key: str | None,
-        job_manager: JobManager,
         websocket_manager: WebSocketManager,
         chat_model: str = CHAT_MODEL,
         anthropic_client_factory: AnthropicClientFactory | None = None,
@@ -241,7 +257,6 @@ class ChatOrchestrator:
     ) -> None:
         self._anthropic_api_key = anthropic_api_key
         self._chat_model = chat_model
-        self._job_manager = job_manager
         self._websocket_manager = websocket_manager
         self._anthropic_client_factory = anthropic_client_factory or (lambda api_key: AsyncAnthropic(api_key=api_key))
         self._convex_client = convex_client
@@ -456,39 +471,14 @@ class ChatOrchestrator:
         system_prompt: str,
         messages: list[dict[str, Any]],
     ) -> Any:
-        if not hasattr(client.messages, "stream"):
-            return await client.messages.create(
-                model=model,
-                max_tokens=1024,
-                temperature=0,
-                system=system_prompt,
-                tools=_TOOL_SCHEMAS,
-                messages=messages,
-            )
-
-        partial_chunks: list[str] = []
-        async with client.messages.stream(
+        return await client.messages.create(
             model=model,
             max_tokens=1024,
             temperature=0,
             system=system_prompt,
             tools=_TOOL_SCHEMAS,
             messages=messages,
-        ) as stream:
-            async for chunk in stream.text_stream:
-                partial_chunks.append(chunk)
-                await self._websocket_manager.send_payload(
-                    client_id,
-                    {
-                        "type": "chat.delta",
-                        "chat_id": chat_id,
-                        "payload": {
-                            "delta": chunk,
-                            "partial": "".join(partial_chunks),
-                        },
-                    },
-                )
-            return await stream.get_final_message()
+        )
 
     async def _execute_tool(
         self,
@@ -519,20 +509,6 @@ class ChatOrchestrator:
         return _ToolExecutionResult(content=json.dumps(result), is_error=False)
 
     async def _dispatch_tool(self, client_id: str, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
-        if tool_name == "search_schematics":
-            request = BuildRequest(
-                query=params["query"],
-                mc_version=DEFAULT_MC_VERSION,
-                client_id=client_id,
-            )
-            created = await self._job_manager.create_job(request)
-            return created.model_dump(mode="json")
-
-        if tool_name == "generate_structure":
-            request = ImagineRequest(prompt=params["prompt"], client_id=client_id)
-            created = await self._job_manager.create_imagine_job(request)
-            return created.model_dump(mode="json")
-
         return await self._websocket_manager.request_tool(client_id, tool_name, params)
 
     async def _resolve_session_for_chat(
@@ -786,17 +762,14 @@ def _validate_tool_args(tool_name: str, raw_input: Any) -> dict[str, Any]:
     if not isinstance(raw_input, dict):
         raise ValueError(f"{tool_name} expects JSON object arguments")
 
-    if tool_name == "search_schematics":
-        parsed = _SearchSchematicsArgs.model_validate(raw_input)
-        return parsed.model_dump(mode="json")
-    if tool_name == "generate_structure":
-        parsed = _GenerateStructureArgs.model_validate(raw_input)
-        return parsed.model_dump(mode="json")
-    if tool_name in {"player_position", "player_inventory", "get_active_overlay", "get_blueprints"}:
+    if tool_name in {"player_position", "player_inventory", "undo_last", "get_active_overlay", "get_blueprints"}:
         parsed = _NoArgs.model_validate(raw_input)
         return parsed.model_dump(mode="json")
     if tool_name == "inspect_area":
         parsed = _InspectAreaArgs.model_validate(raw_input)
+        return parsed.model_dump(mode="json")
+    if tool_name == "place_blocks":
+        parsed = _PlaceBlocksArgs.model_validate(raw_input)
         return parsed.model_dump(mode="json")
     if tool_name == "modify_overlay":
         parsed = _MODIFY_OVERLAY_ADAPTER.validate_python(raw_input)

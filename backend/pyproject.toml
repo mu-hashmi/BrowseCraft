@@ -39,4 +39,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["src"]
+pythonpath = ["src", "../sim/src"]
+markers = [
+  "spatial: live Anthropic spatial reasoning scenarios against the headless voxel simulator",
+]
+addopts = "-m \"not spatial\""

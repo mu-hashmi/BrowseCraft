@@ -19,8 +19,6 @@ def initialize_laminar(api_key: str | None) -> bool:
         project_api_key=api_key,
         instruments={
             Instruments.ANTHROPIC,
-            Instruments.BROWSER_USE,
-            Instruments.GOOGLE_GENAI,
         },
     )
     _laminar_initialized = True
@@ -41,11 +39,7 @@ def laminar_span(name: str, payload: dict[str, Any] | None = None):
 
 def verify_sponsor_imports() -> None:
     from anthropic import Anthropic
-    from browser_use_sdk import AsyncBrowserUse
-    from google import genai
     from supermemory import Supermemory
 
     _ = Anthropic
-    _ = AsyncBrowserUse
-    _ = genai
     _ = Supermemory

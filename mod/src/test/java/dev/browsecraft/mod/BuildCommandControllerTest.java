@@ -122,21 +122,6 @@ class BuildCommandControllerTest {
         }
 
         @Override
-        public String submitBuildQuery(String query, String clientId) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public String submitImaginePrompt(String prompt, String clientId) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public String submitImagineModifyPrompt(String prompt, String clientId) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
         public void submitChatMessage(String message, String clientId, String worldId, String sessionId) {
             this.lastChatMessage = message;
             this.lastChatWorldId = worldId;

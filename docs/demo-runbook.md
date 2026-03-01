@@ -7,7 +7,6 @@ Record a backup end-to-end demo after API keys are configured.
 ## Preflight
 
 1. Fill `backend/.env` with valid keys:
-   - `GOOGLE_API_KEY`
    - `ANTHROPIC_API_KEY`
    - `LAMINAR_API_KEY` (optional but recommended)
    - `CONVEX_URL`, `CONVEX_ACCESS_KEY` (optional)
@@ -24,16 +23,15 @@ Record a backup end-to-end demo after API keys are configured.
 ## Suggested Demo Flow
 
 1. `/build-test` fallback first.
-2. `/build small starter house`.
-3. `/imagine dragon statue`.
-4. `/chat rotate it`.
-5. `/chat make it birch instead of oak`.
-6. `/materials`.
-7. `/blueprints save demo-1`.
-8. `/session new`, then `/chat what did we build?`.
+2. `/chat build a small starter house near me`.
+3. `/chat add windows and a centered doorway`.
+4. `/chat replace oak with birch`.
+5. `/materials`.
+6. `/blueprints save demo-1`.
+7. `/session new`, then `/chat what did we build?`.
 
 ## Recording Notes
 
 - Run the full flow 2-3 times before final recording.
 - Keep backend logs visible for credibility during judging.
-- If an external API is slow, continue with `/build-test` + `/build` path and explain fallback.
+- If the model is slow, continue with `/build-test` and narrate expected `/chat` behavior.
