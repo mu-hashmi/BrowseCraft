@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from browsecraft_backend.chat_orchestrator import CHAT_MODEL, ChatOrchestrator, _tool_status_message
+from browsecraft_backend.chat_orchestrator import CHAT_MODEL, ChatOrchestrator, _TOOL_SCHEMAS, _tool_status_message
 from browsecraft_backend.convex_client import ConvexHttpClient
 from browsecraft_backend.models import ChatRequest
 from browsecraft_backend.supermemory_client import SupermemoryProfileContext, SupermemorySearchResult
@@ -22,6 +22,7 @@ EXPECTED_TOOL_NAMES = {
     "inspect_area",
     "place_blocks",
     "fill_region",
+    "build_geometry",
     "set_plan",
     "undo_last",
     "get_active_overlay",
@@ -30,6 +31,11 @@ EXPECTED_TOOL_NAMES = {
     "save_blueprint",
     "load_blueprint",
 }
+
+
+def test_build_geometry_tool_schema_has_top_level_object_type() -> None:
+    build_geometry_schema = next(schema for schema in _TOOL_SCHEMAS if schema["name"] == "build_geometry")["input_schema"]
+    assert build_geometry_schema["type"] == "object"
 
 
 class FakeAnthropicMessages:
@@ -157,6 +163,7 @@ class FakeWebSocketManager:
                 "block_x": 10,
                 "block_y": 64,
                 "block_z": 20,
+                "ground_y": 63,
                 "facing": "south",
                 "dimension": "minecraft:overworld",
             }
@@ -179,6 +186,7 @@ class SummarizationWebSocketManager(FakeWebSocketManager):
                 "block_x": 0,
                 "block_y": 64,
                 "block_z": 0,
+                "ground_y": 63,
                 "facing": "south",
                 "dimension": "minecraft:overworld",
             }
@@ -210,6 +218,7 @@ class DelayedWebSocketManager(FakeWebSocketManager):
                 "block_x": 10,
                 "block_y": 64,
                 "block_z": 20,
+                "ground_y": 63,
                 "facing": "south",
                 "dimension": "minecraft:overworld",
             }
@@ -237,6 +246,7 @@ class MutablePositionWebSocketManager(FakeWebSocketManager):
                 "block_x": self.block_x,
                 "block_y": self.block_y,
                 "block_z": self.block_z,
+                "ground_y": self.block_y - 1,
                 "facing": self.facing,
                 "dimension": "minecraft:overworld",
             }
@@ -352,6 +362,23 @@ def _text_response(text: str) -> Any:
     return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
 
 
+def _planner_response(*, name: str = "step-1", goal: str = "build", hint: str = "near anchor", success: str = "blocks placed") -> Any:
+    return _text_response(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "name": name,
+                        "goal": goal,
+                        "relative_location_hint": hint,
+                        "success_check": success,
+                    }
+                ]
+            }
+        )
+    )
+
+
 def _messages_of_type(ws: FakeWebSocketManager, event_type: str) -> list[dict[str, Any]]:
     return [payload for _, payload in ws.sent_payloads if payload.get("type") == event_type]
 
@@ -360,6 +387,7 @@ def _messages_of_type(ws: FakeWebSocketManager, event_type: str) -> list[dict[st
 async def test_place_blocks_tool_routes_through_websocket_manager_and_emits_chat_response() -> None:
     anthropic_client = FakeAnthropicClient(
         responses=[
+            _planner_response(name="wall", goal="place wall"),
             _tool_use_response(
                 "place_blocks",
                 {
@@ -395,9 +423,9 @@ async def test_place_blocks_tool_routes_through_websocket_manager_and_emits_chat
         )
     ]
 
-    first_call = anthropic_client.messages.calls[0]
+    first_call = anthropic_client.messages.calls[1]
     assert first_call["model"] == CHAT_MODEL
-    assert first_call["max_tokens"] == 768
+    assert first_call["max_tokens"] == 2048
     assert isinstance(first_call["system"], list)
     assert first_call["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert first_call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
@@ -405,7 +433,7 @@ async def test_place_blocks_tool_routes_through_websocket_manager_and_emits_chat
     assert {tool["name"] for tool in first_call["tools"]} == EXPECTED_TOOL_NAMES
     assert "Locked player position for this request (captured at submit time, authoritative)" in first_call["system"][0]["text"]
     assert "block_x=10, block_y=64, block_z=20" in first_call["system"][0]["text"]
-    assert "build_anchor_x=10, build_anchor_y=64, build_anchor_z=30" in first_call["system"][0]["text"]
+    assert "build_anchor_x=10, build_anchor_y=63, build_anchor_z=30" in first_call["system"][0]["text"]
 
     chat_responses = _messages_of_type(ws, "chat.response")
     assert len(chat_responses) == 1
@@ -512,6 +540,7 @@ async def test_detailed_inspect_radius_limit_is_reported_back_to_model() -> None
 async def test_placement_far_from_live_player_height_is_rejected() -> None:
     anthropic_client = FakeAnthropicClient(
         responses=[
+            _planner_response(name="far-placement", goal="attempt placement"),
             _tool_use_response(
                 "place_blocks",
                 {"placements": [{"x": 10, "y": 300, "z": 20, "block_id": "minecraft:stone"}]},
@@ -528,8 +557,8 @@ async def test_placement_far_from_live_player_height_is_rejected() -> None:
 
     await orchestrator._run_chat(chat_id="chat-y-range", client_id="client-y-range", user_message="build here")
 
-    second_call = anthropic_client.messages.calls[1]
-    tool_result = second_call["messages"][-1]["content"][0]
+    third_call = anthropic_client.messages.calls[2]
+    tool_result = third_call["messages"][-1]["content"][0]
     assert tool_result["is_error"] is True
     assert "detached from current player block_y" in tool_result["content"]
     assert ws.tool_requests == [("client-y-range", "player_position", {})]
@@ -669,6 +698,7 @@ async def test_explicit_session_override_uses_requested_convex_session() -> None
 async def test_supermemory_is_used_for_context_and_meaningful_tool_outcomes() -> None:
     anthropic_client = FakeAnthropicClient(
         responses=[
+            _planner_response(name="memory-build", goal="place remembered block"),
             _tool_use_response(
                 "place_blocks",
                 {"placements": [{"x": 0, "y": 64, "z": 0, "block_id": "minecraft:oak_planks"}]},
@@ -693,7 +723,7 @@ async def test_supermemory_is_used_for_context_and_meaningful_tool_outcomes() ->
 
     await orchestrator._run_chat(chat_id="chat-5", client_id="client-6", user_message="build something")
 
-    first_call = anthropic_client.messages.calls[0]
+    first_call = anthropic_client.messages.calls[1]
     system_text = first_call["system"][0]["text"]
     assert "Relevant long-term memory" in system_text
     assert "Profile static:" in system_text
@@ -834,6 +864,7 @@ async def test_streaming_delta_events_are_sent_over_websocket() -> None:
 async def test_build_intent_retries_when_model_replies_without_placement_tool() -> None:
     anthropic_client = FakeAnthropicClient(
         responses=[
+            _planner_response(name="platform", goal="build platform"),
             _text_response("Done! I placed the platform."),
             _tool_use_response(
                 "fill_region",
@@ -871,15 +902,74 @@ async def test_build_intent_retries_when_model_replies_without_placement_tool() 
             },
         ),
     ]
-    assert len(anthropic_client.messages.calls) == 3
+    assert len(anthropic_client.messages.calls) == 4
     chat_responses = _messages_of_type(ws, "chat.response")
     assert chat_responses[0]["payload"]["message"] == "Placed it."
+
+
+@pytest.mark.asyncio
+async def test_directly_in_front_request_uses_one_block_forward_anchor() -> None:
+    anthropic_client = FakeAnthropicClient(
+        responses=[
+            _planner_response(name="tower", goal="place tower"),
+            _tool_use_response(
+                "place_blocks",
+                {"placements": [{"x": 10, "y": 64, "z": 21, "block_id": "minecraft:stone"}]},
+            ),
+            _text_response("Placed."),
+        ]
+    )
+    ws = FakeWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    await orchestrator._run_chat(
+        chat_id="chat-front-anchor",
+        client_id="client-front-anchor",
+        user_message="build a 3 block tower directly in front of me",
+    )
+
+    first_executor_call = anthropic_client.messages.calls[1]
+    assert "build_anchor_x=10, build_anchor_y=64, build_anchor_z=21" in first_executor_call["system"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_undo_request_executes_undo_last_before_planning() -> None:
+    anthropic_client = FakeAnthropicClient(
+        responses=[
+            _planner_response(name="line", goal="place replacement line"),
+            _tool_use_response(
+                "place_blocks",
+                {"placements": [{"x": 10, "y": 64, "z": 20, "block_id": "minecraft:birch_planks"}]},
+            ),
+            _text_response("Done."),
+        ]
+    )
+    ws = FakeWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    await orchestrator._run_chat(
+        chat_id="chat-undo-first",
+        client_id="client-undo-first",
+        user_message="Undo that and build a birch line",
+    )
+
+    assert ws.tool_requests[0] == ("client-undo-first", "player_position", {})
+    assert ws.tool_requests[1] == ("client-undo-first", "undo_last", {})
 
 
 @pytest.mark.asyncio
 async def test_direct_build_rejects_preview_only_tools() -> None:
     anthropic_client = FakeAnthropicClient(
         responses=[
+            _planner_response(name="platform", goal="build platform"),
             _tool_use_response(
                 "set_plan",
                 {
@@ -924,8 +1014,8 @@ async def test_direct_build_rejects_preview_only_tools() -> None:
             },
         ),
     ]
-    second_call = anthropic_client.messages.calls[1]
-    tool_result = second_call["messages"][-1]["content"][0]
+    third_call = anthropic_client.messages.calls[2]
+    tool_result = third_call["messages"][-1]["content"][0]
     assert tool_result["is_error"] is True
     assert "preview-only" in tool_result["content"]
     chat_responses = _messages_of_type(ws, "chat.response")
@@ -1050,7 +1140,7 @@ async def test_submit_chat_mode_plan_propagates_to_system_prompt() -> None:
     first_call = anthropic_client.messages.calls[0]
     assert first_call["tool_choice"] == {"type": "any"}
     assert "Request mode for this turn: PLAN." in first_call["system"][0]["text"]
-    assert "build_anchor_x=10, build_anchor_y=64, build_anchor_z=30" in first_call["system"][0]["text"]
+    assert "build_anchor_x=10, build_anchor_y=63, build_anchor_z=30" in first_call["system"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -1077,7 +1167,7 @@ async def test_submit_chat_locks_player_position_at_submit_time() -> None:
     first_call = anthropic_client.messages.calls[0]
     assert "block_x=10, block_y=64, block_z=20" in first_call["system"][0]["text"]
     assert "facing=south" in first_call["system"][0]["text"]
-    assert "build_anchor_x=10, build_anchor_y=64, build_anchor_z=30" in first_call["system"][0]["text"]
+    assert "build_anchor_x=10, build_anchor_y=63, build_anchor_z=30" in first_call["system"][0]["text"]
 
 
 @pytest.mark.asyncio

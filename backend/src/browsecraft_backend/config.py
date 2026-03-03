@@ -14,10 +14,8 @@ class Settings(BaseSettings):
     convex_access_key: str | None = None
     anthropic_api_key: str | None = None
     anthropic_chat_model: str = "claude-sonnet-4-6"
+    anthropic_planner_model: str = "claude-opus-4-6"
     supermemory_api_key: str | None = None
-    browser_use_api_key: str | None = None
-    browser_use_llm: str = "browser-use-llm"
-    browser_use_planet_minecraft_skill_id: str | None = None
 
 
 @lru_cache

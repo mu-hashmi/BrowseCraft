@@ -10,6 +10,7 @@ from browsecraft_backend.schematic_parser import (
     _decode_packed_longs,
     _decode_varints,
     _split_block_state,
+    _strip_bottom_terrain_platform,
     parse_schematic,
 )
 
@@ -180,3 +181,34 @@ def test_parse_legacy_schematic_all_air_returns_empty_list(tmp_path: Path, monke
     nbtlib.File(root).save(path, gzipped=True)
 
     assert parse_schematic(path) == []
+
+
+def test_strip_bottom_terrain_platform_removes_solid_terrain_layer() -> None:
+    placements = [
+        {"dx": 0, "dy": 0, "dz": 0, "block_id": "minecraft:stone", "block_state": {}},
+        {"dx": 1, "dy": 0, "dz": 0, "block_id": "minecraft:dirt", "block_state": {}},
+        {"dx": 0, "dy": 1, "dz": 0, "block_id": "minecraft:oak_planks", "block_state": {}},
+        {"dx": 1, "dy": 1, "dz": 0, "block_id": "minecraft:oak_planks", "block_state": {}},
+    ]
+    stripped = _strip_bottom_terrain_platform(placements)
+    assert stripped == [
+        {"dx": 0, "dy": 1, "dz": 0, "block_id": "minecraft:oak_planks", "block_state": {}},
+        {"dx": 1, "dy": 1, "dz": 0, "block_id": "minecraft:oak_planks", "block_state": {}},
+    ]
+
+
+def test_strip_bottom_terrain_platform_keeps_non_full_or_non_terrain_bottom() -> None:
+    missing_footprint = [
+        {"dx": 0, "dy": 0, "dz": 0, "block_id": "minecraft:stone", "block_state": {}},
+        {"dx": 0, "dy": 1, "dz": 0, "block_id": "minecraft:oak_planks", "block_state": {}},
+        {"dx": 1, "dy": 1, "dz": 0, "block_id": "minecraft:oak_planks", "block_state": {}},
+    ]
+    assert _strip_bottom_terrain_platform(missing_footprint) == missing_footprint
+
+    non_terrain_bottom = [
+        {"dx": 0, "dy": 0, "dz": 0, "block_id": "minecraft:oak_planks", "block_state": {}},
+        {"dx": 1, "dy": 0, "dz": 0, "block_id": "minecraft:dirt", "block_state": {}},
+        {"dx": 0, "dy": 1, "dz": 0, "block_id": "minecraft:glass", "block_state": {}},
+        {"dx": 1, "dy": 1, "dz": 0, "block_id": "minecraft:glass", "block_state": {}},
+    ]
+    assert _strip_bottom_terrain_platform(non_terrain_bottom) == non_terrain_bottom

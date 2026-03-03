@@ -71,6 +71,17 @@ Then run `/chat <message>` in-game.
 3. Inspect failing scenario assertions and adjust prompt/tool behavior.
 4. Re-run until stable.
 
+### Headless simulator iteration
+
+Use the simulator to validate structural outcomes without launching Minecraft:
+
+```bash
+cd ~/BrowseCraft/sim
+uv run browsecraft-sim \"build a 5x5 stone platform\" --report-json --slice-y 64
+```
+
+The JSON report includes world diff metrics, block-count/height/connectivity validation, and optional ASCII slice output for quick diagnosis.
+
 ### Token-cost controls
 
 - Prompt caching is enabled in chat calls; keep system/tool definitions stable to maximize cache hits.

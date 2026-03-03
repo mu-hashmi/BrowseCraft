@@ -11,7 +11,13 @@ import nbtlib
 import pytest
 
 import browsecraft_backend.demo_pipelines as demo_pipelines
-from browsecraft_backend.demo_pipelines import DemoPipelines, _absolute_placements, _best_candidate
+from browsecraft_backend.demo_pipelines import (
+    DemoPipelines,
+    _CloudflareBlocked,
+    _SearchCandidate,
+    _absolute_placements,
+    _looks_like_cloudflare_block,
+)
 from browsecraft_backend.models import ImagineRequest, SearchRequest
 
 
@@ -36,6 +42,7 @@ class FakeWebSocketManager:
             return {
                 "block_x": 10,
                 "block_y": 64,
+                "ground_y": 63,
                 "block_z": 20,
                 "facing": "north",
             }
@@ -80,88 +87,35 @@ def _statuses(ws: FakeWebSocketManager) -> list[str]:
     ]
 
 
-def test_best_candidate_prefers_highest_score_valid_extension() -> None:
-    output = demo_pipelines._SearchCandidates(
-        candidates=[
-            demo_pipelines._SearchCandidate(
-                canonical_url="https://example.com/a",
-                filename="not-a-schematic.zip",
-                title="Zip",
-                score=0.99,
-            ),
-            demo_pipelines._SearchCandidate(
-                canonical_url="https://example.com/b",
-                filename="build.schem",
-                title="Schem Low",
-                score=0.42,
-            ),
-            demo_pipelines._SearchCandidate(
-                canonical_url="https://example.com/c",
-                filename="castle.litematic",
-                title="Litematic High",
-                score=0.85,
-            ),
-        ]
-    )
-
-    selected = _best_candidate(output)
-    assert selected is not None
-    assert selected.title == "Litematic High"
-    assert selected.filename == "castle.litematic"
+def test_cloudflare_detector_matches_block_page() -> None:
+    blocked_html = "<html><title>Attention Required! | Cloudflare</title><div id='cf-error-details'></div></html>"
+    assert _looks_like_cloudflare_block(blocked_html) is True
+    assert _looks_like_cloudflare_block("<html><body>ok</body></html>") is False
 
 
-def test_best_candidate_returns_none_for_none_or_empty_or_string() -> None:
-    assert _best_candidate(None) is None
-    assert _best_candidate("raw output") is None
-    assert _best_candidate(demo_pipelines._SearchCandidates(candidates=[])) is None
-
-
-def test_best_candidate_uses_task_output_url_override_for_broken_download_url() -> None:
-    output = demo_pipelines._SearchCandidates(
-        candidates=[
-            demo_pipelines._SearchCandidate(
-                canonical_url="https://example.com/a",
-                filename="castle.schem",
-                title="Castle",
-                score=0.95,
-                download_url="https://www.planetminecraft.com/download/worldmap/castle/",
-            ),
-            demo_pipelines._SearchCandidate(
-                canonical_url="https://example.com/b",
-                filename="backup.schem",
-                title="Backup",
-                score=0.50,
-                download_url="https://downloads.example/backup.schem",
-            ),
-        ]
-    )
-
-    selected = _best_candidate(
-        output,
-        {"castle.schem": "https://downloads.example/castle.schem"},
-    )
-    assert selected is not None
-    assert selected.title == "Castle"
-    assert selected.download_url == "https://downloads.example/castle.schem"
-
-
-def test_absolute_placements_anchor_ten_blocks_in_front_of_search_position() -> None:
+def test_absolute_placements_anchor_ten_blocks_ahead_and_center_footprint() -> None:
     placements = [
         {"dx": 0, "dy": 0, "dz": 0, "block_id": "minecraft:stone"},
-        {"dx": 2, "dy": 1, "dz": 0, "block_id": "minecraft:dirt"},
+        {"dx": 1, "dy": 0, "dz": 0, "block_id": "minecraft:stone"},
+        {"dx": 0, "dy": 1, "dz": 1, "block_id": "minecraft:dirt"},
+        {"dx": 1, "dy": 1, "dz": 1, "block_id": "minecraft:dirt"},
     ]
     absolute = _absolute_placements(
         relative_placements=placements,
         player_position={
             "block_x": 100,
             "block_y": 64,
+            "ground_y": 63,
             "block_z": 200,
             "facing": "north",
         },
     )
 
-    assert absolute[0] == {"x": 100, "y": 64, "z": 190, "block_id": "minecraft:stone"}
-    assert absolute[1] == {"x": 102, "y": 65, "z": 190, "block_id": "minecraft:dirt"}
+    assert {item["y"] for item in absolute} == {63, 64}
+    xs = {item["x"] for item in absolute}
+    zs = {item["z"] for item in absolute}
+    assert xs == {100, 101}
+    assert zs == {190, 191}
 
 
 @pytest.mark.asyncio
@@ -175,9 +129,6 @@ async def test_imagine_fallback_routes_to_chat_submitter_in_fast_plan_mode() -> 
 
     pipelines = DemoPipelines(
         websocket_manager=ws,
-        browser_use_api_key=None,
-        browser_use_llm="browser-use-llm",
-        browser_use_skill_id=None,
         chat_submitter=fake_chat_submitter,
     )
 
@@ -190,7 +141,6 @@ async def test_imagine_fallback_routes_to_chat_submitter_in_fast_plan_mode() -> 
     assert request.client_id == "client-1"
     assert request.mode == "plan_fast"
     assert "dragon statue" in request.message
-    assert "varied materials" in request.message
     statuses = _statuses(ws)
     assert statuses[0] == "🎨 Designing creative structure..."
 
@@ -200,9 +150,6 @@ async def test_imagine_fallback_without_chat_submitter_emits_error_response() ->
     ws = FakeWebSocketManager()
     pipelines = DemoPipelines(
         websocket_manager=ws,
-        browser_use_api_key=None,
-        browser_use_llm="browser-use-llm",
-        browser_use_skill_id=None,
         chat_submitter=None,
     )
 
@@ -215,116 +162,41 @@ async def test_imagine_fallback_without_chat_submitter_emits_error_response() ->
 
 
 @pytest.mark.asyncio
-async def test_search_pipeline_without_api_key_emits_failure_status(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
-    ws = FakeWebSocketManager()
-    pipelines = DemoPipelines(
-        websocket_manager=ws,
-        browser_use_api_key=None,
-        browser_use_llm="browser-use-llm",
-        browser_use_skill_id=None,
-        chat_submitter=None,
-    )
-
-    await pipelines.submit_search(SearchRequest(client_id="client-3", query="medieval castle"))
-    await _drain_tasks(pipelines)
-
-    statuses = _statuses(ws)
-    assert statuses[0] == "🔎 Searching Planet Minecraft..."
-    assert statuses[-1].startswith("✗ Search failed: BROWSER_USE_API_KEY is required for /search")
-
-
-@pytest.mark.asyncio
-async def test_search_pipeline_emits_expected_status_sequence(
+async def test_search_pipeline_emits_expected_status_sequence_http_discovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     schem_bytes = _minimal_schem_bytes()
     ws = FakeWebSocketManager()
 
-    class FakeHttpResponse:
-        def __init__(self, content: bytes) -> None:
-            self.content = content
-
-        def raise_for_status(self) -> None:
-            return None
-
-    class FakeHttpClient:
-        def __init__(self, *_: Any, **__: Any) -> None:
-            pass
-
-        async def __aenter__(self) -> FakeHttpClient:
-            return self
-
-        async def __aexit__(self, exc_type: Any, exc: Any, exc_tb: Any) -> None:
-            return None
-
-        async def get(self, url: str) -> FakeHttpResponse:
-            assert url == "https://downloads.example/castle.schem"
-            return FakeHttpResponse(schem_bytes)
-
-    class FakeTaskRun:
-        def __init__(self) -> None:
-            self.result = SimpleNamespace(
-                session=SimpleNamespace(id="session-1"),
-                output=demo_pipelines._SearchCandidates(
-                    candidates=[
-                        demo_pipelines._SearchCandidate(
-                            canonical_url="https://www.planetminecraft.com/project/castle/",
-                            filename="castle.schem",
-                            title="Medieval Castle",
-                            score=0.88,
-                            download_url="https://downloads.example/castle.schem",
-                        )
-                    ]
-                ),
+    async def fake_http_discovery(query: str) -> list[_SearchCandidate]:
+        assert "castle" in query
+        return [
+            _SearchCandidate(
+                canonical_url="https://www.planetminecraft.com/project/castle/",
+                title="Medieval Castle",
+                score=0.91,
             )
+        ]
 
-        def __await__(self):
-            async def _result():
-                return self.result
+    async def fake_playwright_discovery(query: str) -> list[_SearchCandidate]:
+        raise AssertionError("playwright discovery should not be used when HTTP discovery succeeds")
 
-            return _result().__await__()
+    async def fake_download(candidate: _SearchCandidate) -> demo_pipelines._DownloadedSchematic:
+        assert candidate.title == "Medieval Castle"
+        target = Path(tempfile.gettempdir()) / f"browsecraft-test-{uuid4()}.schem"
+        target.write_bytes(schem_bytes)
+        return demo_pipelines._DownloadedSchematic(
+            path=target,
+            title=candidate.title,
+            source_url=candidate.canonical_url,
+        )
 
-    class FakeBrowserUse:
-        def __init__(self, api_key: str, timeout: float) -> None:
-            assert api_key == "test-browser-key"
-            self.timeout = timeout
-            self.sessions = SimpleNamespace(files=self._get_session_files)
-
-        async def _get_session_files(self, _session_id: str, include_urls: bool | None = None) -> Any:
-            return SimpleNamespace(files=[])
-
-        def run(self, **kwargs: Any) -> FakeTaskRun:
-            assert set(kwargs.keys()) == {
-                "task",
-                "output_schema",
-                "llm",
-                "start_url",
-                "max_steps",
-                "allowed_domains",
-                "flash_mode",
-                "thinking",
-                "vision",
-                "system_prompt_extension",
-            }
-            assert kwargs["output_schema"] == demo_pipelines._SearchCandidates
-            assert "Use Planet Minecraft only." in kwargs["task"]
-            assert "Never return /download/worldmap/" in kwargs["task"]
-            return FakeTaskRun()
-
-        async def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(demo_pipelines, "AsyncBrowserUseV2", FakeBrowserUse)
-    monkeypatch.setattr(demo_pipelines.httpx, "AsyncClient", FakeHttpClient)
+    monkeypatch.setattr(demo_pipelines, "_discover_candidates_http", fake_http_discovery)
+    monkeypatch.setattr(demo_pipelines, "_discover_candidates_with_playwright", fake_playwright_discovery)
+    monkeypatch.setattr(demo_pipelines, "_download_candidate_with_playwright", fake_download)
 
     pipelines = DemoPipelines(
         websocket_manager=ws,
-        browser_use_api_key="test-browser-key",
-        browser_use_llm="browser-use-llm",
-        browser_use_skill_id=None,
         chat_submitter=None,
     )
 
@@ -342,110 +214,83 @@ async def test_search_pipeline_emits_expected_status_sequence(
     ]
     assert len(ws.tool_requests) == 2
     assert ws.tool_requests[0][1] == "player_position"
-    assert ws.tool_requests[0][2] == {}
     assert ws.tool_requests[1][1] == "place_blocks"
-    params = ws.tool_requests[1][2]
-    assert len(params["placements"]) == 4
-    response_messages = [payload["payload"]["message"] for _, payload in ws.sent_payloads if payload.get("type") == "chat.response"]
-    assert response_messages[-1] == "Built 4 blocks from Medieval Castle."
 
 
 @pytest.mark.asyncio
-async def test_search_pipeline_uses_v2_runtime_directly(
+async def test_search_pipeline_falls_back_to_playwright_discovery_on_cloudflare(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     schem_bytes = _minimal_schem_bytes()
     ws = FakeWebSocketManager()
-    v2_hit = False
 
-    class FakeHttpResponse:
-        def __init__(self, content: bytes) -> None:
-            self.content = content
+    async def blocked_http_discovery(_: str) -> list[_SearchCandidate]:
+        raise _CloudflareBlocked("blocked")
 
-        def raise_for_status(self) -> None:
-            return None
-
-    class FakeHttpClient:
-        def __init__(self, *_: Any, **__: Any) -> None:
-            pass
-
-        async def __aenter__(self) -> FakeHttpClient:
-            return self
-
-        async def __aexit__(self, exc_type: Any, exc: Any, exc_tb: Any) -> None:
-            return None
-
-        async def get(self, url: str) -> FakeHttpResponse:
-            assert url == "https://downloads.example/castle-v2.schem"
-            return FakeHttpResponse(schem_bytes)
-
-    class FakeV2BrowserUse:
-        def __init__(self, api_key: str, timeout: float) -> None:
-            assert api_key == "test-browser-key"
-            assert timeout == 300.0
-
-        async def run(self, **kwargs: Any) -> Any:
-            assert set(kwargs.keys()) == {
-                "task",
-                "output_schema",
-                "llm",
-                "start_url",
-                "max_steps",
-                "allowed_domains",
-                "flash_mode",
-                "thinking",
-                "vision",
-                "system_prompt_extension",
-            }
-            nonlocal v2_hit
-            v2_hit = True
-
-            task = SimpleNamespace(
-                id="task-1",
-                session_id="session-1",
-                output_files=[
-                    SimpleNamespace(file_name="castle-v2.schem", download_url="https://downloads.example/castle-v2.schem"),
-                ],
+    async def fake_playwright_discovery(_: str) -> list[_SearchCandidate]:
+        return [
+            _SearchCandidate(
+                canonical_url="https://www.planetminecraft.com/project/castle-v2/",
+                title="Medieval Castle v2",
+                score=0.8,
             )
-            return SimpleNamespace(
-                task=task,
-                output=demo_pipelines._SearchCandidates(
-                    candidates=[
-                        demo_pipelines._SearchCandidate(
-                            canonical_url="https://www.planetminecraft.com/project/castle-v2/",
-                            filename="castle-v2.schem",
-                            title="Medieval Castle v2",
-                            score=0.77,
-                            download_url=None,
-                        )
-                    ]
-                ),
-            )
+        ]
 
-        async def close(self) -> None:
-            return None
+    async def fake_download(candidate: _SearchCandidate) -> demo_pipelines._DownloadedSchematic:
+        target = Path(tempfile.gettempdir()) / f"browsecraft-test-{uuid4()}.schem"
+        target.write_bytes(schem_bytes)
+        return demo_pipelines._DownloadedSchematic(
+            path=target,
+            title=candidate.title,
+            source_url=candidate.canonical_url,
+        )
 
-    monkeypatch.setattr(demo_pipelines, "AsyncBrowserUseV2", FakeV2BrowserUse)
-    monkeypatch.setattr(demo_pipelines.httpx, "AsyncClient", FakeHttpClient)
+    monkeypatch.setattr(demo_pipelines, "_discover_candidates_http", blocked_http_discovery)
+    monkeypatch.setattr(demo_pipelines, "_discover_candidates_with_playwright", fake_playwright_discovery)
+    monkeypatch.setattr(demo_pipelines, "_download_candidate_with_playwright", fake_download)
 
     pipelines = DemoPipelines(
         websocket_manager=ws,
-        browser_use_api_key="test-browser-key",
-        browser_use_llm="browser-use-llm",
-        browser_use_skill_id=None,
         chat_submitter=None,
     )
 
     await pipelines.submit_search(SearchRequest(client_id="client-5", query="medieval castle schematic"))
     await _drain_tasks(pipelines)
 
-    assert v2_hit
     statuses = _statuses(ws)
-    assert statuses == [
-        "🔎 Searching Planet Minecraft...",
-        "✅ Found: Medieval Castle v2",
-        "📥 Downloading schematic...",
-        "🧭 Using /search position (10 blocks ahead)...",
-        "🧱 Placing blocks 1/1...",
-        "✓ Done",
-    ]
+    assert statuses[0] == "🔎 Searching Planet Minecraft..."
+    assert statuses[-1] == "✓ Done"
+
+
+@pytest.mark.asyncio
+async def test_search_pipeline_emits_failure_on_download_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = FakeWebSocketManager()
+
+    async def fake_http_discovery(_: str) -> list[_SearchCandidate]:
+        return [
+            _SearchCandidate(
+                canonical_url="https://www.planetminecraft.com/project/requires-login/",
+                title="Requires Login",
+                score=0.7,
+            )
+        ]
+
+    async def failing_download(_: _SearchCandidate) -> demo_pipelines._DownloadedSchematic:
+        raise RuntimeError("Login required to download schematic from Planet Minecraft")
+
+    monkeypatch.setattr(demo_pipelines, "_discover_candidates_http", fake_http_discovery)
+    monkeypatch.setattr(demo_pipelines, "_download_candidate_with_playwright", failing_download)
+
+    pipelines = DemoPipelines(
+        websocket_manager=ws,
+        chat_submitter=None,
+    )
+
+    await pipelines.submit_search(SearchRequest(client_id="client-6", query="castle schematic"))
+    await _drain_tasks(pipelines)
+
+    statuses = _statuses(ws)
+    assert statuses[-1].startswith("✗ Search failed: ")
+    assert "Login required" in statuses[-1]

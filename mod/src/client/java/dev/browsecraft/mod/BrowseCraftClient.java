@@ -8,18 +8,23 @@ import com.google.gson.JsonObject;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.minecraft.block.BlockState;
+import net.minecraft.client.font.TextRenderer;
+import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.util.ScreenshotRecorder;
+import net.minecraft.client.util.Window;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
+import net.minecraft.text.OrderedText;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.WorldSavePath;
@@ -52,6 +57,12 @@ public final class BrowseCraftClient implements ClientModInitializer {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final int CHAT_BUILD_TEST_TIMEOUT_TICKS = 20 * 90;
     private static final int CHAT_BUILD_TEST_SETTLE_TICKS = 20;
+    private static final int HUD_MARGIN = 10;
+    private static final int HUD_PANEL_WIDTH = 340;
+    private static final int HUD_PANEL_HEIGHT = 210;
+    private static final int HUD_HEADER_HEIGHT = 20;
+    private static final int HUD_INPUT_HEIGHT = 24;
+    private static final int HUD_INSET = 7;
     private static final Set<String> TERRAIN_BLOCK_IDS = Set.of(
             "minecraft:grass_block",
             "minecraft:dirt",
@@ -110,7 +121,9 @@ public final class BrowseCraftClient implements ClientModInitializer {
     private final List<JsonObject> buildTestStatusTimeline = new ArrayList<>();
     private int inventoryPollCountdown;
     private volatile String latestStatusMessage = "";
-    private final List<ChatPanelScreen.ChatMessage> chatHistory = new ArrayList<>();
+    private final HudChatState hudChatState = new HudChatState();
+    private final Map<Integer, Boolean> hudKeyPressedState = new HashMap<>();
+    private final List<ChatMessage> chatHistory = new ArrayList<>();
     private String activeToolStatus = "";
     private boolean assistantStreaming;
 
@@ -167,6 +180,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
         registerKeyBindings();
         registerCommands();
         registerClientTick();
+        registerHudRenderer();
         ghostRenderer.register();
     }
 
@@ -220,13 +234,13 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
             dispatcher.register(literal("chat")
                     .executes(context -> {
-                        openChatPanel(MinecraftClient.getInstance(), "");
+                        openHudInput("");
                         return 1;
                     })
                     .then(argument("message", StringArgumentType.greedyString())
                             .executes(context -> {
                                 String message = StringArgumentType.getString(context, "message");
-                                openChatPanel(MinecraftClient.getInstance(), message);
+                                openHudInput(message);
                                 return 1;
                             })));
 
@@ -242,7 +256,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
                     .then(argument("query", StringArgumentType.greedyString())
                             .executes(context -> {
                                 String query = StringArgumentType.getString(context, "query");
-                                openChatPanel(MinecraftClient.getInstance(), "");
+                                hudChatState.ensureHudVisible();
                                 commandController.submitSearch(query);
                                 return 1;
                             })));
@@ -251,7 +265,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
                     .then(argument("prompt", StringArgumentType.greedyString())
                             .executes(context -> {
                                 String prompt = StringArgumentType.getString(context, "prompt");
-                                openChatPanel(MinecraftClient.getInstance(), "");
+                                hudChatState.ensureHudVisible();
                                 commandController.submitImagine(prompt);
                                 return 1;
                             })));
@@ -299,11 +313,11 @@ public final class BrowseCraftClient implements ClientModInitializer {
     private void registerClientTick() {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (openChatKey.wasPressed()) {
-                if (client.currentScreen instanceof ChatPanelScreen) {
-                    client.setScreen(null);
-                } else {
-                    openChatPanel(client, "");
-                }
+                hudChatState.cycleMode();
+                hudKeyPressedState.clear();
+            }
+            if (hudChatState.mode() == HudChatState.Mode.INPUT) {
+                handleHudInput(client);
             }
 
             if (client.player == null || client.world == null) {
@@ -390,19 +404,16 @@ public final class BrowseCraftClient implements ClientModInitializer {
         });
     }
 
-    private void openChatPanel(MinecraftClient client, String prefill) {
-        if (client == null) {
-            return;
-        }
-        client.setScreen(new ChatPanelScreen(
-                this::submitChatFromPanel,
-                this::chatHistorySnapshot,
-                this::toolStatusLabel,
-                prefill
-        ));
+    private void registerHudRenderer() {
+        HudRenderCallback.EVENT.register((drawContext, tickCounter) -> renderHud(drawContext));
     }
 
-    private void submitChatFromPanel(String message) {
+    private void openHudInput(String prefill) {
+        hudChatState.openInput(prefill);
+        hudKeyPressedState.clear();
+    }
+
+    private void submitChatFromHud(String message) {
         if (message.startsWith("/plan ")) {
             String planPrompt = message.substring("/plan ".length()).trim();
             if (!planPrompt.isEmpty()) {
@@ -427,11 +438,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
         commandController.submitChat(message);
     }
 
-    private List<ChatPanelScreen.ChatMessage> chatHistorySnapshot() {
-        return List.copyOf(chatHistory);
-    }
-
-    private String toolStatusLabel() {
+    private String hudStatusLabel() {
         if (activeToolStatus.isBlank()) {
             if (assistantStreaming) {
                 return "thinking...";
@@ -441,8 +448,194 @@ public final class BrowseCraftClient implements ClientModInitializer {
         return activeToolStatus;
     }
 
+    private void handleHudInput(MinecraftClient client) {
+        Window window = client.getWindow();
+        boolean shiftDown = InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT_SHIFT)
+                || InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT_SHIFT);
+
+        if (wasPressedThisTick(window, GLFW.GLFW_KEY_ESCAPE)) {
+            hudChatState.cancelInput();
+            hudKeyPressedState.clear();
+            return;
+        }
+        if (wasPressedThisTick(window, GLFW.GLFW_KEY_ENTER) || wasPressedThisTick(window, GLFW.GLFW_KEY_KP_ENTER)) {
+            String message = hudChatState.submit();
+            hudKeyPressedState.clear();
+            if (!message.isEmpty()) {
+                submitChatFromHud(message);
+            }
+            return;
+        }
+        if (wasPressedThisTick(window, GLFW.GLFW_KEY_BACKSPACE)) {
+            hudChatState.backspace();
+        }
+        if (wasPressedThisTick(window, GLFW.GLFW_KEY_LEFT)) {
+            hudChatState.moveLeft();
+        }
+        if (wasPressedThisTick(window, GLFW.GLFW_KEY_RIGHT)) {
+            hudChatState.moveRight();
+        }
+
+        for (int keyCode = GLFW.GLFW_KEY_SPACE; keyCode <= GLFW.GLFW_KEY_Z; keyCode++) {
+            if (!wasPressedThisTick(window, keyCode)) {
+                continue;
+            }
+            char value = keyCodeToChar(keyCode, shiftDown);
+            if (value != 0) {
+                hudChatState.insert(value);
+            }
+        }
+
+        int[] punctuationKeys = {
+                GLFW.GLFW_KEY_COMMA,
+                GLFW.GLFW_KEY_PERIOD,
+                GLFW.GLFW_KEY_SLASH,
+                GLFW.GLFW_KEY_SEMICOLON,
+                GLFW.GLFW_KEY_APOSTROPHE,
+                GLFW.GLFW_KEY_LEFT_BRACKET,
+                GLFW.GLFW_KEY_RIGHT_BRACKET,
+                GLFW.GLFW_KEY_MINUS,
+                GLFW.GLFW_KEY_EQUAL,
+                GLFW.GLFW_KEY_BACKSLASH,
+                GLFW.GLFW_KEY_GRAVE_ACCENT
+        };
+        for (int keyCode : punctuationKeys) {
+            if (!wasPressedThisTick(window, keyCode)) {
+                continue;
+            }
+            char value = keyCodeToChar(keyCode, shiftDown);
+            if (value != 0) {
+                hudChatState.insert(value);
+            }
+        }
+    }
+
+    private boolean wasPressedThisTick(Window window, int keyCode) {
+        boolean down = InputUtil.isKeyPressed(window, keyCode);
+        boolean wasDown = hudKeyPressedState.getOrDefault(keyCode, false);
+        hudKeyPressedState.put(keyCode, down);
+        return down && !wasDown;
+    }
+
+    private char keyCodeToChar(int keyCode, boolean shifted) {
+        if (keyCode >= GLFW.GLFW_KEY_A && keyCode <= GLFW.GLFW_KEY_Z) {
+            char base = (char) ('a' + (keyCode - GLFW.GLFW_KEY_A));
+            return shifted ? Character.toUpperCase(base) : base;
+        }
+        if (keyCode >= GLFW.GLFW_KEY_0 && keyCode <= GLFW.GLFW_KEY_9) {
+            if (!shifted) {
+                return (char) ('0' + (keyCode - GLFW.GLFW_KEY_0));
+            }
+            return switch (keyCode) {
+                case GLFW.GLFW_KEY_1 -> '!';
+                case GLFW.GLFW_KEY_2 -> '@';
+                case GLFW.GLFW_KEY_3 -> '#';
+                case GLFW.GLFW_KEY_4 -> '$';
+                case GLFW.GLFW_KEY_5 -> '%';
+                case GLFW.GLFW_KEY_6 -> '^';
+                case GLFW.GLFW_KEY_7 -> '&';
+                case GLFW.GLFW_KEY_8 -> '*';
+                case GLFW.GLFW_KEY_9 -> '(';
+                case GLFW.GLFW_KEY_0 -> ')';
+                default -> 0;
+            };
+        }
+        return switch (keyCode) {
+            case GLFW.GLFW_KEY_SPACE -> ' ';
+            case GLFW.GLFW_KEY_COMMA -> shifted ? '<' : ',';
+            case GLFW.GLFW_KEY_PERIOD -> shifted ? '>' : '.';
+            case GLFW.GLFW_KEY_SLASH -> shifted ? '?' : '/';
+            case GLFW.GLFW_KEY_SEMICOLON -> shifted ? ':' : ';';
+            case GLFW.GLFW_KEY_APOSTROPHE -> shifted ? '"' : '\'';
+            case GLFW.GLFW_KEY_LEFT_BRACKET -> shifted ? '{' : '[';
+            case GLFW.GLFW_KEY_RIGHT_BRACKET -> shifted ? '}' : ']';
+            case GLFW.GLFW_KEY_MINUS -> shifted ? '_' : '-';
+            case GLFW.GLFW_KEY_EQUAL -> shifted ? '+' : '=';
+            case GLFW.GLFW_KEY_BACKSLASH -> shifted ? '|' : '\\';
+            case GLFW.GLFW_KEY_GRAVE_ACCENT -> shifted ? '~' : '`';
+            default -> 0;
+        };
+    }
+
+    private void renderHud(DrawContext context) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.options.hudHidden || hudChatState.mode() == HudChatState.Mode.HIDDEN) {
+            return;
+        }
+
+        int screenWidth = client.getWindow().getScaledWidth();
+        int screenHeight = client.getWindow().getScaledHeight();
+        int panelWidth = Math.min(HUD_PANEL_WIDTH, screenWidth - (HUD_MARGIN * 2));
+        int inputOffset = hudChatState.mode() == HudChatState.Mode.INPUT ? HUD_INPUT_HEIGHT + HUD_MARGIN : 0;
+        int maxPanelHeight = screenHeight - (HUD_MARGIN * 2) - inputOffset;
+        int panelHeight = Math.min(HUD_PANEL_HEIGHT, Math.max(80, maxPanelHeight));
+        int left = screenWidth - panelWidth - HUD_MARGIN;
+        int top = HUD_MARGIN;
+        int right = left + panelWidth;
+        int bottom = top + panelHeight;
+
+        context.fill(left, top, right, bottom, 0xB0101010);
+        String status = hudStatusLabel();
+        String header = status.isBlank() ? "BrowseCraft" : status;
+        context.drawText(client.textRenderer, header, left + HUD_INSET, top + 6, 0xFFE8E8A0, false);
+
+        int textWidth = panelWidth - (HUD_INSET * 2);
+        int messagesTop = top + HUD_HEADER_HEIGHT;
+        int messagesBottom = bottom - HUD_INSET;
+        List<RenderedLine> lines = buildRenderedLines(chatHistory, client.textRenderer, textWidth);
+        int lineHeight = client.textRenderer.fontHeight + 2;
+        int maxVisible = Math.max(1, (messagesBottom - messagesTop) / lineHeight);
+        int start = Math.max(0, lines.size() - maxVisible);
+        int y = messagesTop;
+        for (int index = start; index < lines.size(); index++) {
+            RenderedLine line = lines.get(index);
+            context.drawText(client.textRenderer, line.text(), left + HUD_INSET, y, line.color(), false);
+            y += lineHeight;
+        }
+
+        if (hudChatState.mode() == HudChatState.Mode.INPUT) {
+            renderInputBar(context, client.textRenderer, screenWidth, screenHeight);
+        }
+    }
+
+    private void renderInputBar(DrawContext context, TextRenderer textRenderer, int screenWidth, int screenHeight) {
+        int left = HUD_MARGIN;
+        int right = screenWidth - HUD_MARGIN;
+        int bottom = screenHeight - HUD_MARGIN;
+        int top = bottom - HUD_INPUT_HEIGHT;
+
+        context.fill(left, top, right, bottom, 0xC0202020);
+        String prompt = "> " + hudChatState.inputText();
+        context.drawText(textRenderer, prompt, left + HUD_INSET, top + 8, 0xFFFFFFFF, false);
+
+        if ((System.currentTimeMillis() / 500) % 2 == 0) {
+            int cursorIndex = Math.max(0, Math.min(hudChatState.cursor(), hudChatState.inputText().length()));
+            int cursorX = left + HUD_INSET + textRenderer.getWidth("> " + hudChatState.inputText().substring(0, cursorIndex));
+            context.fill(cursorX, top + 6, cursorX + 1, bottom - 6, 0xFFFFFFFF);
+        }
+    }
+
+    private static List<RenderedLine> buildRenderedLines(List<ChatMessage> messages, TextRenderer textRenderer, int width) {
+        List<RenderedLine> lines = new ArrayList<>();
+        for (ChatMessage message : messages) {
+            int color = message.role() == ChatRole.USER ? 0xFF7FD7FF : 0xFFF0F0F0;
+            String prefix = message.role() == ChatRole.USER ? "You: " : "AI: ";
+            Text text = Text.literal(prefix + message.text());
+            List<OrderedText> wrapped = textRenderer.wrapLines(text, width);
+            if (wrapped.isEmpty()) {
+                lines.add(new RenderedLine(Text.literal(prefix).asOrderedText(), color));
+                continue;
+            }
+            for (OrderedText wrappedLine : wrapped) {
+                lines.add(new RenderedLine(wrappedLine, color));
+            }
+        }
+        return lines;
+    }
+
     private void handleChatUserMessage(String message) {
-        chatHistory.add(new ChatPanelScreen.ChatMessage(ChatPanelScreen.ChatRole.USER, message));
+        hudChatState.ensureHudVisible();
+        chatHistory.add(new ChatMessage(ChatRole.USER, message));
         assistantStreaming = true;
     }
 
@@ -451,32 +644,31 @@ public final class BrowseCraftClient implements ClientModInitializer {
             return;
         }
         int lastIndex = chatHistory.size() - 1;
-        if (lastIndex < 0 || chatHistory.get(lastIndex).role() != ChatPanelScreen.ChatRole.ASSISTANT || !assistantStreaming) {
-            chatHistory.add(new ChatPanelScreen.ChatMessage(ChatPanelScreen.ChatRole.ASSISTANT, delta));
+        if (lastIndex < 0 || chatHistory.get(lastIndex).role() != ChatRole.ASSISTANT || !assistantStreaming) {
+            chatHistory.add(new ChatMessage(ChatRole.ASSISTANT, delta));
         } else {
-            ChatPanelScreen.ChatMessage last = chatHistory.get(lastIndex);
-            chatHistory.set(lastIndex, new ChatPanelScreen.ChatMessage(last.role(), last.text() + delta));
+            ChatMessage last = chatHistory.get(lastIndex);
+            chatHistory.set(lastIndex, new ChatMessage(last.role(), last.text() + delta));
         }
+        hudChatState.ensureHudVisible();
         assistantStreaming = true;
     }
 
     private void handleChatAssistantMessage(String message) {
         int lastIndex = chatHistory.size() - 1;
-        if (lastIndex >= 0 && chatHistory.get(lastIndex).role() == ChatPanelScreen.ChatRole.ASSISTANT) {
-            chatHistory.set(lastIndex, new ChatPanelScreen.ChatMessage(ChatPanelScreen.ChatRole.ASSISTANT, message));
+        if (lastIndex >= 0 && chatHistory.get(lastIndex).role() == ChatRole.ASSISTANT) {
+            chatHistory.set(lastIndex, new ChatMessage(ChatRole.ASSISTANT, message));
         } else {
-            chatHistory.add(new ChatPanelScreen.ChatMessage(ChatPanelScreen.ChatRole.ASSISTANT, message));
+            chatHistory.add(new ChatMessage(ChatRole.ASSISTANT, message));
         }
+        hudChatState.ensureHudVisible();
         assistantStreaming = false;
         activeToolStatus = "";
     }
 
     private void handleToolStatus(String status) {
         activeToolStatus = status;
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player != null && client.currentScreen instanceof ChatPanelScreen) {
-            client.player.sendMessage(Text.literal(status), true);
-        }
+        hudChatState.ensureHudVisible();
     }
 
     private void runBuildTestCommand(MinecraftClient client) {
@@ -871,6 +1063,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
         position.addProperty("block_x", client.player.getBlockX());
         position.addProperty("block_y", client.player.getBlockY());
         position.addProperty("block_z", client.player.getBlockZ());
+        position.addProperty("ground_y", findGroundY(client.world, client.player.getBlockPos()));
         position.addProperty("facing", client.player.getHorizontalFacing().asString());
         position.addProperty("dimension", client.world.getRegistryKey().getValue().toString());
         return position;
@@ -1076,15 +1269,36 @@ public final class BrowseCraftClient implements ClientModInitializer {
         int anchorX = Integer.MAX_VALUE;
         int anchorY = Integer.MAX_VALUE;
         int anchorZ = Integer.MAX_VALUE;
+        List<PlacementBatchPlanner.Placement> plannerInput = new ArrayList<>(targetByPos.size());
         List<AbsolutePlacement> previousPlacements = new ArrayList<>(targetByPos.size());
         for (Map.Entry<BlockPos, String> entry : targetByPos.entrySet()) {
             BlockPos pos = entry.getKey();
             String previousBlockId = Registries.BLOCK.getId(client.world.getBlockState(pos).getBlock()).toString();
+            plannerInput.add(new PlacementBatchPlanner.Placement(pos.getX(), pos.getY(), pos.getZ(), entry.getValue()));
             previousPlacements.add(new AbsolutePlacement(pos.getX(), pos.getY(), pos.getZ(), previousBlockId));
-            sendCommand(client, "setblock " + pos.getX() + " " + pos.getY() + " " + pos.getZ() + " " + entry.getValue() + " replace");
             anchorX = Math.min(anchorX, pos.getX());
             anchorY = Math.min(anchorY, pos.getY());
             anchorZ = Math.min(anchorZ, pos.getZ());
+        }
+
+        PlacementBatchPlanner.Plan batchPlan = PlacementBatchPlanner.plan(plannerInput);
+        for (PlacementBatchPlanner.Cuboid cuboid : batchPlan.fillCuboids()) {
+            sendCommand(client, fillCommand(
+                    cuboid.minX(),
+                    cuboid.minY(),
+                    cuboid.minZ(),
+                    cuboid.maxX(),
+                    cuboid.maxY(),
+                    cuboid.maxZ(),
+                    cuboid.blockId()
+            ));
+        }
+        List<String> queuedSetblockCommands = new ArrayList<>(batchPlan.setBlocks().size());
+        for (PlacementBatchPlanner.Placement setBlock : batchPlan.setBlocks()) {
+            queuedSetblockCommands.add(setblockCommand(setBlock.x(), setBlock.y(), setBlock.z(), setBlock.blockId()));
+        }
+        for (String command : queuedSetblockCommands) {
+            sendCommand(client, command);
         }
 
         undoWorldPlacements = previousPlacements;
@@ -1096,6 +1310,8 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
         JsonObject result = new JsonObject();
         result.addProperty("placed_count", targetByPos.size());
+        result.addProperty("fill_count", batchPlan.fillCuboids().size());
+        result.addProperty("setblock_count", batchPlan.setBlocks().size());
         result.add("anchor", blockPosToJson(anchor));
         return result;
     }
@@ -1129,7 +1345,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
             }
         }
 
-        sendCommand(client, "fill " + minX + " " + minY + " " + minZ + " " + maxX + " " + maxY + " " + maxZ + " " + blockId + " replace");
+        sendCommand(client, fillCommand(minX, minY, minZ, maxX, maxY, maxZ, blockId));
         undoWorldPlacements = previousPlacements;
         undoBlueprintState = null;
         undoClearsOverlay = false;
@@ -1153,7 +1369,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
                 throw new IllegalStateException("undo_last requires an active player and network handler");
             }
             for (AbsolutePlacement placement : undoWorldPlacements) {
-                sendCommand(client, "setblock " + placement.x() + " " + placement.y() + " " + placement.z() + " " + placement.blockId() + " replace");
+                sendCommand(client, setblockCommand(placement.x(), placement.y(), placement.z(), placement.blockId()));
             }
             undoWorldPlacements = null;
         } else if (undoClearsOverlay) {
@@ -1170,6 +1386,14 @@ public final class BrowseCraftClient implements ClientModInitializer {
         result.addProperty("undone", true);
         result.add("overlay", activeOverlaySummary(overlayState.snapshot()));
         return result;
+    }
+
+    private String fillCommand(int minX, int minY, int minZ, int maxX, int maxY, int maxZ, String blockId) {
+        return "fill " + minX + " " + minY + " " + minZ + " " + maxX + " " + maxY + " " + maxZ + " " + blockId + " replace";
+    }
+
+    private String setblockCommand(int x, int y, int z, String blockId) {
+        return "setblock " + x + " " + y + " " + z + " " + blockId + " replace";
     }
 
     private void sendCommand(MinecraftClient client, String command) {
@@ -1278,6 +1502,18 @@ public final class BrowseCraftClient implements ClientModInitializer {
         json.addProperty("y", pos.getY());
         json.addProperty("z", pos.getZ());
         return json;
+    }
+
+    private int findGroundY(ClientWorld world, BlockPos playerPos) {
+        int bottomY = world.getBottomY();
+        for (int y = playerPos.getY() - 1; y >= bottomY; y--) {
+            BlockPos scanPos = new BlockPos(playerPos.getX(), y, playerPos.getZ());
+            BlockState state = world.getBlockState(scanPos);
+            if (!state.isAir() && !state.getCollisionShape(world, scanPos).isEmpty()) {
+                return y;
+            }
+        }
+        return playerPos.getY() - 1;
     }
 
     private BlockPos requiredBlockPos(JsonObject object, String key) {
@@ -1543,6 +1779,17 @@ public final class BrowseCraftClient implements ClientModInitializer {
             return "";
         }
         return instance.latestStatusMessage;
+    }
+
+    private enum ChatRole {
+        USER,
+        ASSISTANT
+    }
+
+    private record ChatMessage(ChatRole role, String text) {
+    }
+
+    private record RenderedLine(OrderedText text, int color) {
     }
 
     private record AbsolutePlacement(int x, int y, int z, String blockId) {

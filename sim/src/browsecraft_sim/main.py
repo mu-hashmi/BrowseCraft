@@ -65,6 +65,36 @@ class HeadlessVoxelWorld:
                 changed[coord] = after_block
         return changed
 
+    def diff_report(
+        self,
+        before: dict[Coord, str],
+        after: dict[Coord, str] | None = None,
+    ) -> dict[str, Any]:
+        compared_after = self.blocks if after is None else after
+        changed = self.diff(before, compared_after)
+
+        added = 0
+        removed = 0
+        updated = 0
+        for coord, after_block in changed.items():
+            before_block = before.get(coord, "minecraft:air")
+            if before_block == "minecraft:air" and after_block != "minecraft:air":
+                added += 1
+            elif before_block != "minecraft:air" and after_block == "minecraft:air":
+                removed += 1
+            else:
+                updated += 1
+
+        report: dict[str, Any] = {
+            "changed_count": len(changed),
+            "added_count": added,
+            "removed_count": removed,
+            "updated_count": updated,
+        }
+        if changed:
+            report["bbox"] = _bbox_dict(changed.keys())
+        return report
+
     def set_block(self, coord: Coord, block_id: str) -> None:
         canonical_block_id = block_id.split("[", 1)[0]
         if canonical_block_id == "minecraft:air":
@@ -207,6 +237,57 @@ class HeadlessVoxelWorld:
             "items": [],
         }
 
+    def ascii_slice(self, *, y: int) -> str:
+        layer_coords = [coord for coord in self.blocks if coord[1] == y]
+        if not layer_coords:
+            return f"y={y} (empty)"
+
+        min_x = min(coord[0] for coord in layer_coords)
+        max_x = max(coord[0] for coord in layer_coords)
+        min_z = min(coord[2] for coord in layer_coords)
+        max_z = max(coord[2] for coord in layer_coords)
+
+        rows = [f"y={y} x={min_x}..{max_x} z={min_z}..{max_z}"]
+        for z in range(min_z, max_z + 1):
+            chars: list[str] = []
+            for x in range(min_x, max_x + 1):
+                block_id = self.block_at((x, y, z))
+                if block_id == "minecraft:air":
+                    chars.append(".")
+                    continue
+                short = block_id.rsplit(":", maxsplit=1)[-1]
+                chars.append(short[0].upper())
+            rows.append("".join(chars))
+        return "\n".join(rows)
+
+    def validation_report(self) -> dict[str, Any]:
+        if not self.blocks:
+            return {
+                "block_count": 0,
+                "height": {"min": None, "max": None},
+                "bbox": None,
+                "dimensions": {"x": 0, "y": 0, "z": 0},
+                "connected": False,
+                "component_count": 0,
+            }
+
+        coords = list(self.blocks.keys())
+        bbox = _bbox_dict(coords)
+        ys = [coord[1] for coord in coords]
+        components = _component_count(set(coords))
+        return {
+            "block_count": len(coords),
+            "height": {"min": min(ys), "max": max(ys)},
+            "bbox": bbox,
+            "dimensions": {
+                "x": bbox["max"]["x"] - bbox["min"]["x"] + 1,
+                "y": bbox["max"]["y"] - bbox["min"]["y"] + 1,
+                "z": bbox["max"]["z"] - bbox["min"]["z"] + 1,
+            },
+            "connected": components == 1,
+            "component_count": components,
+        }
+
     def flat_terrain(
         self,
         *,
@@ -270,7 +351,42 @@ def world_bounding_box(blocks: Iterable[Coord]) -> tuple[Coord, Coord]:
     return (min_x, min_y, min_z), (max_x, max_y, max_z)
 
 
-async def run_chat_simulation(message: str, base_url: str, client_id: str, world: HeadlessVoxelWorld) -> str:
+def _bbox_dict(blocks: Iterable[Coord]) -> dict[str, dict[str, int]]:
+    minimum, maximum = world_bounding_box(blocks)
+    return {
+        "min": {"x": minimum[0], "y": minimum[1], "z": minimum[2]},
+        "max": {"x": maximum[0], "y": maximum[1], "z": maximum[2]},
+    }
+
+
+def _component_count(coords: set[Coord]) -> int:
+    if not coords:
+        return 0
+
+    offsets = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+    remaining = set(coords)
+    components = 0
+    while remaining:
+        components += 1
+        queue = [remaining.pop()]
+        while queue:
+            x, y, z = queue.pop()
+            for ox, oy, oz in offsets:
+                neighbor = (x + ox, y + oy, z + oz)
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    queue.append(neighbor)
+    return components
+
+
+async def run_chat_simulation(
+    message: str,
+    base_url: str,
+    client_id: str,
+    world: HeadlessVoxelWorld,
+    *,
+    verbose: bool = True,
+) -> str:
     ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/v1/ws/{client_id}"
     chat_id: str
 
@@ -282,7 +398,8 @@ async def run_chat_simulation(message: str, base_url: str, client_id: str, world
             )
             response.raise_for_status()
             chat_id = str(response.json()["chat_id"])
-            print(f"created chat {chat_id}")
+            if verbose:
+                print(f"created chat {chat_id}")
 
         async for raw_message in websocket:
             envelope = json.loads(raw_message)
@@ -295,13 +412,15 @@ async def run_chat_simulation(message: str, base_url: str, client_id: str, world
             if event_type == "chat.delta":
                 payload = envelope.get("payload", {})
                 partial = payload.get("partial", "")
-                print(f"delta: {partial}")
+                if verbose:
+                    print(f"delta: {partial}")
                 continue
 
             if event_type == "chat.response" and envelope.get("chat_id") == chat_id:
                 payload = envelope.get("payload", {})
                 message_text = str(payload.get("message", ""))
-                print(f"chat.response: {message_text}")
+                if verbose:
+                    print(f"chat.response: {message_text}")
                 return message_text
 
     raise RuntimeError("WebSocket closed before chat.response")
@@ -413,6 +532,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("message", help="chat prompt")
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--client-id", default=None)
+    parser.add_argument("--report-json", action="store_true")
+    parser.add_argument("--slice-y", type=int, default=None)
     return parser
 
 
@@ -420,8 +541,26 @@ def main() -> None:
     args = build_parser().parse_args()
     world = HeadlessVoxelWorld()
     world.flat_terrain(radius=32)
+    before = world.snapshot()
     client_id = args.client_id or str(uuid.uuid4())
-    asyncio.run(run_chat_simulation(args.message, args.base_url, client_id, world))
+    assistant_message = asyncio.run(
+        run_chat_simulation(
+            args.message,
+            args.base_url,
+            client_id,
+            world,
+            verbose=not args.report_json,
+        )
+    )
+    if args.report_json:
+        report: dict[str, Any] = {
+            "assistant_message": assistant_message,
+            "validation": world.validation_report(),
+            "diff": world.diff_report(before),
+        }
+        if args.slice_y is not None:
+            report["ascii_slice"] = world.ascii_slice(y=args.slice_y)
+        print(json.dumps(report, sort_keys=True))
 
 
 if __name__ == "__main__":

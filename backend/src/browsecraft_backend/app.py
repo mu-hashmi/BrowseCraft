@@ -46,6 +46,7 @@ def _build_chat_orchestrator(settings: Settings, ws_manager: WebSocketManager) -
         anthropic_api_key=settings.anthropic_api_key,
         websocket_manager=ws_manager,
         chat_model=settings.anthropic_chat_model,
+        planner_model=settings.anthropic_planner_model,
     )
 
 
@@ -56,9 +57,6 @@ def _build_demo_pipelines(
 ) -> DemoPipelines:
     return DemoPipelines(
         websocket_manager=ws_manager,
-        browser_use_api_key=settings.browser_use_api_key,
-        browser_use_llm=settings.browser_use_llm,
-        browser_use_skill_id=settings.browser_use_planet_minecraft_skill_id,
         chat_submitter=chat_orchestrator.submit_chat,
     )
 

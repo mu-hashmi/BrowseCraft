@@ -9,16 +9,33 @@ import nbtlib
 
 
 _LEGACY_BLOCKS: dict[str, str] | None = None
+_TERRAIN_PLATFORM_BLOCK_IDS = {
+    "minecraft:stone",
+    "minecraft:grass_block",
+    "minecraft:dirt",
+    "minecraft:coarse_dirt",
+    "minecraft:podzol",
+    "minecraft:mycelium",
+    "minecraft:rooted_dirt",
+    "minecraft:sand",
+    "minecraft:red_sand",
+    "minecraft:gravel",
+    "minecraft:deepslate",
+    "minecraft:tuff",
+}
 
 
 def parse_schematic(path: Path) -> list[dict[str, Any]]:
     suffix = path.suffix.lower()
     if suffix == ".schem":
-        return _parse_sponge_schem(path)
+        placements = _parse_sponge_schem(path)
+        return _strip_bottom_terrain_platform(placements)
     if suffix == ".litematic":
-        return _parse_litematic(path)
+        placements = _parse_litematic(path)
+        return _strip_bottom_terrain_platform(placements)
     if suffix == ".schematic":
-        return _parse_legacy_schematic(path)
+        placements = _parse_legacy_schematic(path)
+        return _strip_bottom_terrain_platform(placements)
     raise ValueError(f"Unsupported schematic extension: {suffix}")
 
 
@@ -285,3 +302,29 @@ def _load_legacy_map() -> dict[str, str]:
         legacy_path = Path(__file__).with_name("legacy_blocks.json")
         _LEGACY_BLOCKS = json.loads(legacy_path.read_text())
     return _LEGACY_BLOCKS
+
+
+def _strip_bottom_terrain_platform(placements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not placements:
+        return placements
+
+    min_y = min(int(item["dy"]) for item in placements)
+    max_y = max(int(item["dy"]) for item in placements)
+    if max_y <= min_y:
+        return placements
+    footprint = {(int(item["dx"]), int(item["dz"])) for item in placements}
+    bottom_by_footprint: dict[tuple[int, int], dict[str, Any]] = {
+        (int(item["dx"]), int(item["dz"])): item
+        for item in placements
+        if int(item["dy"]) == min_y
+    }
+    if len(bottom_by_footprint) != len(footprint):
+        return placements
+
+    bottom_blocks = list(bottom_by_footprint.values())
+    if not bottom_blocks:
+        return placements
+    if any(str(item["block_id"]) not in _TERRAIN_PLATFORM_BLOCK_IDS for item in bottom_blocks):
+        return placements
+
+    return [item for item in placements if int(item["dy"]) != min_y]

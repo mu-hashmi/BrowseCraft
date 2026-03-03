@@ -15,6 +15,7 @@ from lmnr import observe
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from .convex_client import ConvexHttpClient
+from .geometry_primitives import bounding_box, build_geometry
 from .models import (
     ChatAcceptedResponse,
     ChatRequest,
@@ -29,6 +30,7 @@ from .websocket_manager import WebSocketManager
 logger = logging.getLogger(__name__)
 
 CHAT_MODEL = "claude-sonnet-4-6"
+PLANNER_MODEL = "claude-opus-4-6"
 _DEFAULT_WORLD_ID = "default"
 _SYSTEM_PROMPT = (
     "You are BrowseCraft's Minecraft in-game assistant.\n"
@@ -42,6 +44,10 @@ _SYSTEM_PROMPT = (
     "Do not assume default world heights like y=64.\n"
     "Treat block_x/block_y/block_z from player_position as context only when no existing target structure "
     "has been identified and the user did not provide explicit absolute coordinates.\n"
+    "Treat relative phrasing like 'in front of me', 'behind me', 'next to me', 'left/right of me' as explicit "
+    "location instructions derived from locked player_position; do not reinterpret those as the default 10-block build_anchor.\n"
+    "If the user says 'directly in front of me' without a distance, use exactly one block forward from block_x/block_z.\n"
+    "For immediate relative placements around the player, default vertical placement to block_y unless the user specifies y.\n"
     "Do not create floating structures unless explicitly requested. Ensure builds are grounded or attached.\n"
     "Before modifying existing structures, inspect first. Use inspect_area with detailed=true when position-level data is needed.\n"
     "When using detailed inspections, keep filter_terrain=true unless terrain layout is directly relevant.\n"
@@ -49,26 +55,31 @@ _SYSTEM_PROMPT = (
     "If a request references walls/faces, map orientation using coordinates: south face = max z, north face = min z, "
     "east face = max x, west face = min x.\n"
     "For axis-aligned cuboids (walls, floors, roofs, boxes), prefer fill_region over enumerating many blocks.\n"
+    "For regular geometric structures, prefer build_geometry and keep place_blocks for details/irregular edits.\n"
     "For iterative edits, preserve existing structure and apply minimal diffs instead of rebuilding unrelated parts.\n"
-    "For large custom builds, split work into multiple place_blocks calls instead of one huge placement list.\n"
+    "For large custom builds, split work into multiple batches; keep each place_blocks batch reasonably small.\n"
     "Default mode is direct building: use place_blocks/fill_region to place blocks immediately.\n"
     "Use set_plan only when the user explicitly asks for a preview/blueprint/plan, "
     "or when the build is large enough that positioning first is safer.\n"
     "When the user asks for creative structures, use varied materials, depth/layering, "
     "decorative details, and stairs/slabs where appropriate so results feel hand-built.\n"
+    "If the user asks to undo/revert the previous build, call undo_last before applying replacement placements.\n"
     "If a placement batch is clearly wrong, call undo_last and retry with corrected coordinates.\n"
     "Use tools for factual game state instead of guessing."
 )
 _MAX_TOOL_ROUNDS = 20
 _CONTEXT_MESSAGE_LIMIT = 12
-_MAX_MODEL_OUTPUT_TOKENS = 768
+_MAX_MODEL_OUTPUT_TOKENS = 2048
 _MAX_Y_DELTA_FROM_PLAYER = 96
 _DEFAULT_FORWARD_BUILD_OFFSET = 10
+_PLACE_BLOCK_BATCH_SIZE = 256
+_MAX_STEP_RETRIES = 2
 _CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 _TOOL_RESULT_SUMMARY_PREFIX = "[summarized tool_result]"
 _MEMORY_OUTCOME_TOOLS = {
     "place_blocks",
     "fill_region",
+    "build_geometry",
     "set_plan",
     "undo_last",
     "modify_overlay",
@@ -143,6 +154,138 @@ class _FillRegionArgs(_ToolArgs):
         return self
 
 
+class _BuildGeometryBaseArgs(_ToolArgs):
+    material: str = Field(min_length=1)
+    anchor: _BlockPositionArgs
+    rotation: Literal["north", "east", "south", "west"] = "north"
+
+
+class _BuildGeometryBoxArgs(_BuildGeometryBaseArgs):
+    shape: Literal["box"]
+    width: int = Field(ge=1, le=128)
+    height: int = Field(ge=1, le=128)
+    depth: int = Field(ge=1, le=128)
+    hollow: bool = False
+
+
+class _BuildGeometryCylinderArgs(_BuildGeometryBaseArgs):
+    shape: Literal["cylinder"]
+    radius: int = Field(ge=0, le=64)
+    height: int = Field(ge=1, le=128)
+    hollow: bool = False
+
+
+class _BuildGeometrySphereArgs(_BuildGeometryBaseArgs):
+    shape: Literal["sphere"]
+    radius: int = Field(ge=0, le=32)
+    hollow: bool = False
+
+
+class _BuildGeometryFloorArgs(_BuildGeometryBaseArgs):
+    shape: Literal["floor"]
+    width: int = Field(ge=1, le=128)
+    depth: int = Field(ge=1, le=128)
+    thickness: int = Field(default=1, ge=1, le=32)
+
+
+class _BuildGeometryWallArgs(_BuildGeometryBaseArgs):
+    shape: Literal["wall"]
+    width: int = Field(ge=1, le=128)
+    height: int = Field(ge=1, le=128)
+    thickness: int = Field(default=1, ge=1, le=32)
+
+
+class _BuildGeometryPillarArgs(_BuildGeometryBaseArgs):
+    shape: Literal["pillar"]
+    height: int = Field(ge=1, le=256)
+    width: int = Field(default=1, ge=1, le=32)
+    depth: int = Field(default=1, ge=1, le=32)
+
+
+class _BuildGeometryStairsArgs(_BuildGeometryBaseArgs):
+    shape: Literal["stairs"]
+    width: int = Field(ge=1, le=128)
+    depth: int = Field(ge=1, le=128)
+    height: int = Field(ge=1, le=128)
+
+
+class _BuildGeometryRoofFlatArgs(_BuildGeometryBaseArgs):
+    shape: Literal["roof_flat"]
+    width: int = Field(ge=1, le=128)
+    depth: int = Field(ge=1, le=128)
+    thickness: int = Field(default=1, ge=1, le=32)
+
+
+class _BuildGeometryRoofGabledArgs(_BuildGeometryBaseArgs):
+    shape: Literal["roof_gabled"]
+    width: int = Field(ge=1, le=128)
+    depth: int = Field(ge=1, le=128)
+    height: int | None = Field(default=None, ge=1, le=64)
+
+
+class _BuildGeometryRoofHippedArgs(_BuildGeometryBaseArgs):
+    shape: Literal["roof_hipped"]
+    width: int = Field(ge=1, le=128)
+    depth: int = Field(ge=1, le=128)
+    height: int | None = Field(default=None, ge=1, le=64)
+
+
+_BuildGeometryUnion = Annotated[
+    _BuildGeometryBoxArgs
+    | _BuildGeometryCylinderArgs
+    | _BuildGeometrySphereArgs
+    | _BuildGeometryFloorArgs
+    | _BuildGeometryWallArgs
+    | _BuildGeometryPillarArgs
+    | _BuildGeometryStairsArgs
+    | _BuildGeometryRoofFlatArgs
+    | _BuildGeometryRoofGabledArgs
+    | _BuildGeometryRoofHippedArgs,
+    Field(discriminator="shape"),
+]
+_BUILD_GEOMETRY_ADAPTER = TypeAdapter(_BuildGeometryUnion)
+_BUILD_GEOMETRY_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "shape": {
+            "type": "string",
+            "enum": [
+                "box",
+                "cylinder",
+                "sphere",
+                "floor",
+                "wall",
+                "pillar",
+                "stairs",
+                "roof_flat",
+                "roof_gabled",
+                "roof_hipped",
+            ],
+        },
+        "material": {"type": "string", "minLength": 1},
+        "anchor": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "z": {"type": "integer"},
+            },
+            "required": ["x", "y", "z"],
+            "additionalProperties": False,
+        },
+        "rotation": {"type": "string", "enum": ["north", "east", "south", "west"]},
+        "width": {"type": "integer", "minimum": 1, "maximum": 128},
+        "height": {"type": "integer", "minimum": 1, "maximum": 256},
+        "depth": {"type": "integer", "minimum": 1, "maximum": 128},
+        "radius": {"type": "integer", "minimum": 0, "maximum": 64},
+        "thickness": {"type": "integer", "minimum": 1, "maximum": 32},
+        "hollow": {"type": "boolean"},
+    },
+    "required": ["shape", "material", "anchor"],
+    "additionalProperties": False,
+}
+
+
 class _ModifyOverlayRotateArgs(_ToolArgs):
     op: Literal["rotate"]
     quarters: int = 1
@@ -205,8 +348,20 @@ class _PlayerPositionResult(BaseModel):
     block_x: int
     block_y: int
     block_z: int
+    ground_y: int | None = None
     facing: str = Field(min_length=1)
     dimension: str = Field(min_length=1)
+
+
+class _BuildStepModel(BaseModel):
+    name: str = Field(min_length=1)
+    goal: str = Field(min_length=1)
+    relative_location_hint: str = Field(min_length=1)
+    success_check: str = Field(min_length=1)
+
+
+class _BuildStepPlanModel(BaseModel):
+    steps: list[_BuildStepModel] = Field(min_length=1, max_length=12)
 
 
 @dataclass(slots=True, frozen=True)
@@ -318,6 +473,15 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
         "input_schema": _FillRegionArgs.model_json_schema(),
     },
     {
+        "name": "build_geometry",
+        "description": (
+            "Build deterministic regular shapes around an anchor (box, cylinder, sphere, floor, wall, pillar, stairs, flat/gabled/hipped roofs). "
+            "Anchor is the center with negative-bias centering for even sizes. "
+            "Use rotation for cardinal orientation. Prefer this tool for regular geometry."
+        ),
+        "input_schema": _BUILD_GEOMETRY_TOOL_SCHEMA,
+    },
+    {
         "name": "set_plan",
         "description": "Load a relative-coordinate plan into preview mode as a ghost overlay.",
         "input_schema": _SetPlanArgs.model_json_schema(),
@@ -360,6 +524,7 @@ _CACHEABLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
 _PLAN_DISALLOWED_TOOL_NAMES = {
     "place_blocks",
     "fill_region",
+    "build_geometry",
     "undo_last",
 }
 _PLAN_FAST_ALLOWED_TOOL_NAMES = {"set_plan"}
@@ -371,12 +536,14 @@ class ChatOrchestrator:
         anthropic_api_key: str | None,
         websocket_manager: WebSocketManager,
         chat_model: str = CHAT_MODEL,
+        planner_model: str = PLANNER_MODEL,
         anthropic_client_factory: AnthropicClientFactory | None = None,
         convex_client: ConvexHttpClient | None = None,
         supermemory_client: SupermemoryClientProtocol | None = None,
     ) -> None:
         self._anthropic_api_key = anthropic_api_key
         self._chat_model = chat_model
+        self._planner_model = planner_model
         self._websocket_manager = websocket_manager
         self._anthropic_client_factory = anthropic_client_factory or (lambda api_key: AsyncAnthropic(api_key=api_key))
         self._convex_client = convex_client
@@ -582,134 +749,284 @@ class ChatOrchestrator:
         if not self._anthropic_api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is required for chat orchestrator")
 
-        messages = await self._conversation_messages(world_id=world_id, session_id=session_id)
-        messages.append({"role": "user", "content": user_message})
-
+        base_messages = await self._conversation_messages(world_id=world_id, session_id=session_id)
         memory_context = await self._search_memory_context(
             client_id=client_id,
             world_id=world_id,
             user_message=user_message,
         )
+        anchor_distance = _DEFAULT_FORWARD_BUILD_OFFSET
+        if _is_directly_in_front_request(user_message):
+            anchor_distance = 1
         build_anchor = _forward_build_anchor(
             player_position=player_position,
-            distance=_DEFAULT_FORWARD_BUILD_OFFSET,
+            distance=anchor_distance,
         )
-        system_prompt = (
-            f"{_SYSTEM_PROMPT}\n"
-            f"Request mode for this turn: {request_mode.upper()}.\n"
-            "Locked player position for this request (captured at submit time, authoritative):\n"
-            f"- x={player_position.x:.3f}, y={player_position.y:.3f}, z={player_position.z:.3f}\n"
-            f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
-            f"- facing={player_position.facing}, dimension={player_position.dimension}\n"
-            "Default build anchor for NEW structures in this request (10 blocks ahead of player facing):\n"
-            f"- build_anchor_x={build_anchor.x}, build_anchor_y={build_anchor.y}, build_anchor_z={build_anchor.z}\n"
-            "For new structures, center around this build anchor. "
-            "Only ignore this when the user gives explicit coordinates or requests edits to an existing structure."
-        )
-        if memory_context:
-            system_prompt = (
-                f"{system_prompt}\n"
-                "Relevant long-term memory:\n"
-                f"{memory_context}"
+        if _is_directly_in_front_request(user_message):
+            build_anchor = _BuildAnchor(
+                x=build_anchor.x,
+                y=player_position.block_y,
+                z=build_anchor.z,
             )
+        system_prompt = _compose_system_prompt(
+            request_mode=request_mode,
+            player_position=player_position,
+            build_anchor=build_anchor,
+            memory_context=memory_context,
+        )
 
         client = self._anthropic_client_factory(self._anthropic_api_key)
-        force_tool_use = _is_preview_mode(request_mode) or (request_mode == "build" and _has_build_intent(user_message))
-        mode_tool_schemas = _tool_schemas_for_mode(request_mode)
         try:
-            tool_rounds = 0
-            no_tool_retries = 0
-            applied_build_modification = False
+            if request_mode == "build" and _has_undo_request(user_message):
+                await self._emit_tool_status(client_id=client_id, status="↩ Undoing previous placement...")
+                undo_result = await self._execute_tool(
+                    client_id=client_id,
+                    world_id=world_id,
+                    session_id=session_id,
+                    tool_name="undo_last",
+                    raw_input={},
+                    player_position=player_position,
+                    cached_player_position=player_position,
+                    request_mode="build",
+                )
+                if undo_result.is_error:
+                    raise RuntimeError(f"undo_last failed: {undo_result.content}")
+
+            if request_mode == "build" and _has_build_intent(user_message):
+                await self._emit_tool_status(client_id=client_id, status="🧠 Drafting step plan...")
+                planned_steps = await self._plan_build_steps(
+                    client=client,
+                    client_id=client_id,
+                    chat_id=chat_id,
+                    user_message=user_message,
+                    conversation_messages=base_messages,
+                    player_position=player_position,
+                    build_anchor=build_anchor,
+                )
+                previous_step_outcomes: list[str] = []
+                final_response = ""
+                for step_index, step in enumerate(planned_steps, start=1):
+                    await self._emit_tool_status(
+                        client_id=client_id,
+                        status=f"🧩 Step {step_index}/{len(planned_steps)}: {step.name}",
+                    )
+                    step_message = _step_execution_message(
+                        original_request=user_message,
+                        step=step,
+                        step_index=step_index,
+                        total_steps=len(planned_steps),
+                        previous_step_outcomes=previous_step_outcomes,
+                    )
+                    for attempt in range(_MAX_STEP_RETRIES + 1):
+                        try:
+                            final_response, _ = await self._execute_tool_loop(
+                                client=client,
+                                model=self._chat_model,
+                                client_id=client_id,
+                                chat_id=chat_id,
+                                world_id=world_id,
+                                session_id=session_id,
+                                player_position=player_position,
+                                request_mode="build",
+                                system_prompt=system_prompt,
+                                messages=[*base_messages, {"role": "user", "content": step_message}],
+                                force_tool_use=True,
+                                require_build_modification=False,
+                                enforce_build_intent=True,
+                            )
+                            break
+                        except Exception as exc:
+                            if attempt >= _MAX_STEP_RETRIES:
+                                raise RuntimeError(
+                                    f"Step '{step.name}' failed after {_MAX_STEP_RETRIES + 1} attempts: {exc}"
+                                ) from exc
+                            await self._emit_tool_status(
+                                client_id=client_id,
+                                status=f"↻ Retrying step '{step.name}'...",
+                            )
+                    previous_step_outcomes.append(f"{step.name}: {final_response}")
+                return final_response
+
             if request_mode == "plan":
                 await self._emit_tool_status(client_id=client_id, status="🧠 Drafting preview plan...")
             elif request_mode == "plan_fast":
                 await self._emit_tool_status(client_id=client_id, status="🎨 Designing structure preview...")
-            while True:
-                _summarize_historical_tool_results(messages)
-                tool_choice = _tool_choice_for_round(
-                    request_mode=request_mode,
-                    force_tool_use=force_tool_use,
-                )
-                response = await self._run_model_round(
-                    client=client,
-                    model=self._chat_model,
-                    client_id=client_id,
-                    chat_id=chat_id,
-                    system_prompt=system_prompt,
-                    messages=messages,
-                    tool_schemas=mode_tool_schemas,
-                    tool_choice=tool_choice,
-                )
-                assistant_blocks = _normalize_assistant_blocks(response.content)
-                messages.append({"role": "assistant", "content": assistant_blocks})
-
-                tool_uses = [block for block in assistant_blocks if block["type"] == "tool_use"]
-                if not tool_uses:
-                    assistant_text = _extract_text_response(assistant_blocks)
-                    if (
-                        request_mode == "build"
-                        and _has_build_intent(user_message)
-                        and tool_rounds == 0
-                        and not applied_build_modification
-                        and no_tool_retries < 2
-                    ):
-                        no_tool_retries += 1
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "You must execute this build by calling place_blocks or fill_region. "
-                                    "Do not claim completion without successful placement tool calls."
-                                ),
-                            }
-                        )
-                        continue
-                    return assistant_text
-
-                force_tool_use = False
-                tool_rounds += 1
-                if tool_rounds > _MAX_TOOL_ROUNDS:
-                    raise RuntimeError(f"Exceeded max tool rounds ({_MAX_TOOL_ROUNDS})")
-
-                tool_results: list[dict[str, Any]] = []
-                for tool_use in tool_uses:
-                    tool_status = _tool_status_message(tool_use["name"], tool_use["input"])
-                    await self._emit_tool_status(client_id=client_id, status=tool_status)
-                executions = await asyncio.gather(
-                    *[
-                        self._execute_tool(
-                            client_id=client_id,
-                            world_id=world_id,
-                            session_id=session_id,
-                            tool_name=tool_use["name"],
-                            raw_input=tool_use["input"],
-                            player_position=player_position,
-                            cached_player_position=player_position,
-                            request_mode=request_mode,
-                        )
-                        for tool_use in tool_uses
-                    ]
-                )
-                set_plan_succeeded = False
-                for tool_use, execution in zip(tool_uses, executions, strict=True):
-                    if tool_use["name"] in {"place_blocks", "fill_region"} and not execution.is_error:
-                        applied_build_modification = True
-                    if tool_use["name"] == "set_plan" and not execution.is_error:
-                        set_plan_succeeded = True
-                    tool_result = {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use["id"],
-                        "content": execution.content,
-                    }
-                    if execution.is_error:
-                        tool_result["is_error"] = True
-                    tool_results.append(tool_result)
-
-                messages.append({"role": "user", "content": tool_results})
-                if _is_preview_mode(request_mode) and set_plan_succeeded:
-                    return "Preview loaded. Reposition if needed, then confirm to place."
+            messages = [*base_messages, {"role": "user", "content": user_message}]
+            assistant_text, _ = await self._execute_tool_loop(
+                client=client,
+                model=self._chat_model,
+                client_id=client_id,
+                chat_id=chat_id,
+                world_id=world_id,
+                session_id=session_id,
+                player_position=player_position,
+                request_mode=request_mode,
+                system_prompt=system_prompt,
+                messages=messages,
+                force_tool_use=_is_preview_mode(request_mode) or (request_mode == "build" and _has_build_intent(user_message)),
+                require_build_modification=False,
+                enforce_build_intent=(request_mode == "build" and _has_build_intent(user_message)),
+            )
+            return assistant_text
         finally:
             await client.close()
+
+    async def _plan_build_steps(
+        self,
+        *,
+        client: AsyncAnthropic,
+        client_id: str,
+        chat_id: str,
+        user_message: str,
+        conversation_messages: list[dict[str, Any]],
+        player_position: _PlayerPositionResult,
+        build_anchor: _BuildAnchor,
+    ) -> list[_BuildStepModel]:
+        planner_system_prompt = (
+            "You are a Minecraft build planner. "
+            "Decompose the request into concrete, ordered build steps. "
+            "Return strict JSON only with this schema: "
+            '{"steps":[{"name":"...","goal":"...","relative_location_hint":"...","success_check":"..."}]}. '
+            "Each step must represent physical world modifications."
+        )
+        planner_messages = [
+            *conversation_messages,
+            {
+                "role": "user",
+                "content": (
+                    f"User request: {user_message}\n"
+                    "Locked player position:\n"
+                    f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
+                    f"- facing={player_position.facing}\n"
+                    "Default build anchor:\n"
+                    f"- x={build_anchor.x}, y={build_anchor.y}, z={build_anchor.z}\n"
+                    "Output between 1 and 8 ordered steps."
+                ),
+            }
+        ]
+        response = await self._run_model_round(
+            client=client,
+            model=self._planner_model,
+            client_id=client_id,
+            chat_id=chat_id,
+            system_prompt=planner_system_prompt,
+            messages=planner_messages,
+            tool_schemas=[],
+            tool_choice=None,
+            emit_deltas=False,
+        )
+        planner_blocks = _normalize_assistant_blocks(response.content)
+        planner_text = _extract_text_response(planner_blocks)
+        parsed_plan = _parse_build_step_plan(planner_text)
+        return parsed_plan.steps
+
+    async def _execute_tool_loop(
+        self,
+        *,
+        client: AsyncAnthropic,
+        model: str,
+        client_id: str,
+        chat_id: str,
+        world_id: str,
+        session_id: str,
+        player_position: _PlayerPositionResult,
+        request_mode: Literal["build", "plan", "plan_fast"],
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        force_tool_use: bool,
+        require_build_modification: bool,
+        enforce_build_intent: bool,
+    ) -> tuple[str, bool]:
+        mode_tool_schemas = _tool_schemas_for_mode(request_mode)
+        tool_rounds = 0
+        no_tool_retries = 0
+        applied_build_modification = False
+        while True:
+            _summarize_historical_tool_results(messages)
+            tool_choice = _tool_choice_for_round(
+                request_mode=request_mode,
+                force_tool_use=force_tool_use,
+            )
+            response = await self._run_model_round(
+                client=client,
+                model=model,
+                client_id=client_id,
+                chat_id=chat_id,
+                system_prompt=system_prompt,
+                messages=messages,
+                tool_schemas=mode_tool_schemas,
+                tool_choice=tool_choice,
+            )
+            assistant_blocks = _normalize_assistant_blocks(response.content)
+            messages.append({"role": "assistant", "content": assistant_blocks})
+
+            tool_uses = [block for block in assistant_blocks if block["type"] == "tool_use"]
+            if not tool_uses:
+                assistant_text = _extract_text_response(assistant_blocks)
+                if (
+                    request_mode == "build"
+                    and enforce_build_intent
+                    and tool_rounds == 0
+                    and not applied_build_modification
+                    and no_tool_retries < 2
+                ):
+                    no_tool_retries += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "You must execute this build by calling place_blocks, fill_region, or build_geometry. "
+                                "Do not claim completion without successful world-modifying tool calls."
+                            ),
+                        }
+                    )
+                    continue
+                if require_build_modification and not applied_build_modification:
+                    raise RuntimeError("Step completed without any world-modifying tool calls")
+                return assistant_text, applied_build_modification
+
+            force_tool_use = False
+            tool_rounds += 1
+            if tool_rounds > _MAX_TOOL_ROUNDS:
+                raise RuntimeError(f"Exceeded max tool rounds ({_MAX_TOOL_ROUNDS})")
+
+            tool_results: list[dict[str, Any]] = []
+            for tool_use in tool_uses:
+                tool_status = _tool_status_message(tool_use["name"], tool_use["input"])
+                await self._emit_tool_status(client_id=client_id, status=tool_status)
+            executions = await asyncio.gather(
+                *[
+                    self._execute_tool(
+                        client_id=client_id,
+                        world_id=world_id,
+                        session_id=session_id,
+                        tool_name=tool_use["name"],
+                        raw_input=tool_use["input"],
+                        player_position=player_position,
+                        cached_player_position=player_position,
+                        request_mode=request_mode,
+                    )
+                    for tool_use in tool_uses
+                ]
+            )
+            set_plan_succeeded = False
+            for tool_use, execution in zip(tool_uses, executions, strict=True):
+                if tool_use["name"] in {"place_blocks", "fill_region", "build_geometry"} and not execution.is_error:
+                    applied_build_modification = True
+                if tool_use["name"] == "set_plan" and not execution.is_error:
+                    set_plan_succeeded = True
+                tool_result = {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use["id"],
+                    "content": execution.content,
+                }
+                if execution.is_error:
+                    tool_result["is_error"] = True
+                tool_results.append(tool_result)
+
+            messages.append({"role": "user", "content": tool_results})
+            if _is_preview_mode(request_mode) and set_plan_succeeded:
+                return "Preview loaded. Reposition if needed, then confirm to place.", applied_build_modification
 
     async def _run_model_round(
         self,
@@ -722,6 +1039,7 @@ class ChatOrchestrator:
         messages: list[dict[str, Any]],
         tool_schemas: list[dict[str, Any]],
         tool_choice: dict[str, Any] | None,
+        emit_deltas: bool = True,
     ) -> Any:
         stream_kwargs: dict[str, Any] = {
             "model": model,
@@ -746,6 +1064,8 @@ class ChatOrchestrator:
             async for event in stream:
                 _accumulate_stream_event(fallback_blocks, event)
                 if event.type != "content_block_delta" or event.delta.type != "text_delta":
+                    continue
+                if not emit_deltas:
                     continue
                 delta = event.delta.text
                 partial += delta
@@ -802,18 +1122,53 @@ class ChatOrchestrator:
 
         try:
             params = _validate_tool_args(tool_name, raw_input)
-            _validate_placement_against_player_position(
-                tool_name=tool_name,
-                params=params,
-                player_position=player_position,
-            )
         except (ValidationError, ValueError) as exc:
             return _ToolExecutionResult(content=f"Invalid arguments for {tool_name}: {exc}", is_error=True)
 
         try:
             if tool_name == "player_position":
                 result = cached_player_position.model_dump(mode="json")
+            elif tool_name == "build_geometry":
+                placements = build_geometry(
+                    shape=str(params["shape"]),
+                    material=str(params["material"]),
+                    anchor=params["anchor"],
+                    rotation=str(params["rotation"]),
+                    **{
+                        key: value
+                        for key, value in params.items()
+                        if key not in {"shape", "material", "anchor", "rotation"}
+                    },
+                )
+                _validate_placement_against_player_position(
+                    tool_name="place_blocks",
+                    params={"placements": placements},
+                    player_position=player_position,
+                )
+                placed_count = 0
+                batches = 0
+                for start in range(0, len(placements), _PLACE_BLOCK_BATCH_SIZE):
+                    batch = placements[start:start + _PLACE_BLOCK_BATCH_SIZE]
+                    batch_result = await self._dispatch_tool(
+                        client_id=client_id,
+                        tool_name="place_blocks",
+                        params={"placements": batch},
+                    )
+                    placed_count += int(batch_result["placed_count"])
+                    batches += 1
+                result = {
+                    "shape": params["shape"],
+                    "anchor": params["anchor"],
+                    "batches": batches,
+                    "placed_count": placed_count,
+                    "bbox": bounding_box(placements),
+                }
             else:
+                _validate_placement_against_player_position(
+                    tool_name=tool_name,
+                    params=params,
+                    player_position=player_position,
+                )
                 result = await self._dispatch_tool(client_id=client_id, tool_name=tool_name, params=params)
             await self._store_tool_memory(
                 client_id=client_id,
@@ -1176,6 +1531,16 @@ def _has_build_intent(message: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _has_undo_request(message: str) -> bool:
+    lowered = message.lower()
+    return "undo" in lowered or "revert" in lowered
+
+
+def _is_directly_in_front_request(message: str) -> bool:
+    lowered = message.lower()
+    return "directly in front of me" in lowered or "right in front of me" in lowered
+
+
 def _is_preview_mode(request_mode: Literal["build", "plan", "plan_fast"]) -> bool:
     return request_mode in {"plan", "plan_fast"}
 
@@ -1208,6 +1573,78 @@ def _tool_schemas_for_mode(request_mode: Literal["build", "plan", "plan_fast"]) 
     return _CACHEABLE_TOOL_SCHEMAS
 
 
+def _compose_system_prompt(
+    *,
+    request_mode: Literal["build", "plan", "plan_fast"],
+    player_position: _PlayerPositionResult,
+    build_anchor: _BuildAnchor,
+    memory_context: str,
+) -> str:
+    system_prompt = (
+        f"{_SYSTEM_PROMPT}\n"
+        f"Request mode for this turn: {request_mode.upper()}.\n"
+        "Locked player position for this request (captured at submit time, authoritative):\n"
+        f"- x={player_position.x:.3f}, y={player_position.y:.3f}, z={player_position.z:.3f}\n"
+        f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
+        f"- ground_y={player_position.ground_y}\n"
+        f"- facing={player_position.facing}, dimension={player_position.dimension}\n"
+        "Default build anchor for NEW structures in this request (10 blocks ahead of player facing):\n"
+        f"- build_anchor_x={build_anchor.x}, build_anchor_y={build_anchor.y}, build_anchor_z={build_anchor.z}\n"
+        "For new structures, center around this build anchor. "
+        "Only ignore this when the user gives explicit coordinates or requests edits to an existing structure."
+    )
+    if memory_context:
+        return (
+            f"{system_prompt}\n"
+            "Relevant long-term memory:\n"
+            f"{memory_context}"
+        )
+    return system_prompt
+
+
+def _parse_build_step_plan(raw_text: str) -> _BuildStepPlanModel:
+    payload = raw_text.strip()
+    if payload.startswith("```"):
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start < 0 or end < 0:
+            raise ValueError("Planner response did not contain a JSON object")
+        payload = payload[start:end + 1]
+    try:
+        parsed_json = json.loads(payload)
+    except json.JSONDecodeError:
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start < 0 or end < 0:
+            raise
+        parsed_json = json.loads(payload[start:end + 1])
+    return _BuildStepPlanModel.model_validate(parsed_json)
+
+
+def _step_execution_message(
+    *,
+    original_request: str,
+    step: _BuildStepModel,
+    step_index: int,
+    total_steps: int,
+    previous_step_outcomes: list[str],
+) -> str:
+    prior = "none"
+    if previous_step_outcomes:
+        prior = "\n".join(f"- {line}" for line in previous_step_outcomes)
+    return (
+        f"Original user request: {original_request}\n"
+        f"Execute step {step_index}/{total_steps}.\n"
+        f"Step name: {step.name}\n"
+        f"Goal: {step.goal}\n"
+        f"Relative location hint: {step.relative_location_hint}\n"
+        f"Success check: {step.success_check}\n"
+        "Completed steps so far:\n"
+        f"{prior}\n"
+        "Modify the world now and keep changes from earlier steps."
+    )
+
+
 def _forward_build_anchor(
     *,
     player_position: _PlayerPositionResult,
@@ -1224,9 +1661,13 @@ def _forward_build_anchor(
     elif facing == "west":
         dx = -distance
 
+    anchor_ground_y = player_position.ground_y
+    if anchor_ground_y is None:
+        anchor_ground_y = player_position.block_y - 1
+
     return _BuildAnchor(
         x=player_position.block_x + dx,
-        y=player_position.block_y,
+        y=anchor_ground_y,
         z=player_position.block_z + dz,
     )
 
@@ -1249,6 +1690,9 @@ def _validate_tool_args(tool_name: str, raw_input: Any) -> dict[str, Any]:
         return parsed.model_dump(mode="json")
     if tool_name == "fill_region":
         parsed = _FillRegionArgs.model_validate(raw_input)
+        return parsed.model_dump(mode="json")
+    if tool_name == "build_geometry":
+        parsed = _BUILD_GEOMETRY_ADAPTER.validate_python(raw_input)
         return parsed.model_dump(mode="json")
     if tool_name == "modify_overlay":
         parsed = _MODIFY_OVERLAY_ADAPTER.validate_python(raw_input)
@@ -1353,6 +1797,12 @@ def _summarize_tool_result_content(content: str) -> str:
             f"{_TOOL_RESULT_SUMMARY_PREFIX} fill_region placed_count={payload.get('placed_count')} "
             f"from={payload.get('from_corner')} to={payload.get('to_corner')}"
         )
+    if "shape" in payload and "placed_count" in payload and "batches" in payload:
+        return (
+            f"{_TOOL_RESULT_SUMMARY_PREFIX} build_geometry shape={payload.get('shape')} "
+            f"placed_count={payload.get('placed_count')} batches={payload.get('batches')} "
+            f"bbox={payload.get('bbox')}"
+        )
     if "undone" in payload or "undone_count" in payload:
         return f"{_TOOL_RESULT_SUMMARY_PREFIX} undo_last {json.dumps(payload, sort_keys=True)}"
 
@@ -1419,6 +1869,11 @@ def _tool_status_message(tool_name: str, raw_input: dict[str, Any]) -> str:
         return "🔨 Placing blocks..."
     if tool_name == "fill_region":
         return "🧱 Filling region..."
+    if tool_name == "build_geometry":
+        shape = raw_input.get("shape")
+        if isinstance(shape, str):
+            return f"📏 Building {shape} geometry..."
+        return "📏 Building geometry..."
     if tool_name == "set_plan":
         placements = raw_input.get("placements")
         if isinstance(placements, list):
