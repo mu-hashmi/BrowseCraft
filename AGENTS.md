@@ -1,10 +1,8 @@
 # Instructions For Coding Agents Working With This Repo
 
-This is a hackathon project. Production-readiness is unnecessary.
-
 ## Preferred Codex Test Workflow
 
-BrowseCraft is now `/chat`-first. Validate chat tool use and spatial behavior programmatically.
+Validate chat tool use and spatial behavior programmatically.
 
 ### Non-negotiables
 

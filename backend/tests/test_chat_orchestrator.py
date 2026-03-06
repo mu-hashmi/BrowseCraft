@@ -39,10 +39,18 @@ def test_build_geometry_tool_schema_has_top_level_object_type() -> None:
 
 
 class FakeAnthropicMessages:
-    def __init__(self, responses: list[Any], *, wrapped_stream: bool = False) -> None:
+    def __init__(
+        self,
+        responses: list[Any],
+        *,
+        wrapped_stream: bool = False,
+        create_responses: list[Any] | None = None,
+    ) -> None:
         self._responses = list(responses)
         self._wrapped_stream = wrapped_stream
         self.calls: list[dict[str, Any]] = []
+        self.create_calls: list[dict[str, Any]] = []
+        self._create_responses = list(create_responses or [])
 
     def stream(self, **kwargs: Any) -> Any:
         self.calls.append(copy.deepcopy(kwargs))
@@ -54,13 +62,25 @@ class FakeAnthropicMessages:
         return _FakeAnthropicStreamManager(response)
 
     async def create(self, **kwargs: Any) -> Any:
-        self.calls.append(copy.deepcopy(kwargs))
+        self.create_calls.append(copy.deepcopy(kwargs))
+        if self._create_responses:
+            return self._create_responses.pop(0)
         return SimpleNamespace(content=[SimpleNamespace(type="text", text="")])
 
 
 class FakeAnthropicClient:
-    def __init__(self, responses: list[Any], *, wrapped_stream: bool = False) -> None:
-        self.messages = FakeAnthropicMessages(responses, wrapped_stream=wrapped_stream)
+    def __init__(
+        self,
+        responses: list[Any],
+        *,
+        wrapped_stream: bool = False,
+        create_responses: list[Any] | None = None,
+    ) -> None:
+        self.messages = FakeAnthropicMessages(
+            responses,
+            wrapped_stream=wrapped_stream,
+            create_responses=create_responses,
+        )
         self.closed = False
 
     async def close(self) -> None:
@@ -374,6 +394,27 @@ def _planner_response(*, name: str = "step-1", goal: str = "build", hint: str = 
                         "success_check": success,
                     }
                 ]
+            }
+        )
+    )
+
+
+def _triage_response(
+    *,
+    is_build_request: bool = True,
+    complexity: str = "complex",
+    spatial_reference: str = "default_anchor",
+    distance_hint: int | None = None,
+    should_undo_first: bool = False,
+) -> Any:
+    return _text_response(
+        json.dumps(
+            {
+                "is_build_request": is_build_request,
+                "complexity": complexity,
+                "spatial_reference": spatial_reference,
+                "distance_hint": distance_hint,
+                "should_undo_first": should_undo_first,
             }
         )
     )
@@ -917,7 +958,14 @@ async def test_directly_in_front_request_uses_one_block_forward_anchor() -> None
                 {"placements": [{"x": 10, "y": 64, "z": 21, "block_id": "minecraft:stone"}]},
             ),
             _text_response("Placed."),
-        ]
+        ],
+        create_responses=[
+            _triage_response(
+                complexity="complex",
+                spatial_reference="relative_to_player",
+                distance_hint=1,
+            )
+        ],
     )
     ws = FakeWebSocketManager()
     orchestrator = ChatOrchestrator(
@@ -946,7 +994,14 @@ async def test_undo_request_executes_undo_last_before_planning() -> None:
                 {"placements": [{"x": 10, "y": 64, "z": 20, "block_id": "minecraft:birch_planks"}]},
             ),
             _text_response("Done."),
-        ]
+        ],
+        create_responses=[
+            _triage_response(
+                complexity="complex",
+                spatial_reference="default_anchor",
+                should_undo_first=True,
+            )
+        ],
     )
     ws = FakeWebSocketManager()
     orchestrator = ChatOrchestrator(
@@ -963,6 +1018,41 @@ async def test_undo_request_executes_undo_last_before_planning() -> None:
 
     assert ws.tool_requests[0] == ("client-undo-first", "player_position", {})
     assert ws.tool_requests[1] == ("client-undo-first", "undo_last", {})
+
+
+@pytest.mark.asyncio
+async def test_simple_build_request_skips_planner_phase() -> None:
+    anthropic_client = FakeAnthropicClient(
+        responses=[
+            _tool_use_response(
+                "place_blocks",
+                {"placements": [{"x": 10, "y": 64, "z": 20, "block_id": "minecraft:torch"}]},
+            ),
+            _text_response("Placed torch."),
+        ],
+        create_responses=[
+            _triage_response(
+                complexity="simple",
+                spatial_reference="relative_to_player",
+                distance_hint=0,
+            )
+        ],
+    )
+    ws = FakeWebSocketManager()
+    orchestrator = ChatOrchestrator(
+        anthropic_api_key="test-key",
+        websocket_manager=ws,
+        anthropic_client_factory=lambda api_key: anthropic_client,
+    )
+
+    await orchestrator._run_chat(
+        chat_id="chat-simple-skip-planner",
+        client_id="client-simple-skip-planner",
+        user_message="place a torch here",
+    )
+
+    assert len(anthropic_client.messages.calls) == 2
+    assert anthropic_client.messages.calls[0]["model"] == CHAT_MODEL
 
 
 @pytest.mark.asyncio
@@ -1230,5 +1320,6 @@ async def test_warmup_prompt_cache_is_idempotent() -> None:
     await orchestrator.warmup_prompt_cache()
     await orchestrator.warmup_prompt_cache()
 
-    assert len(anthropic_client.messages.calls) == 1
-    assert anthropic_client.messages.calls[0]["max_tokens"] == 1
+    assert len(anthropic_client.messages.create_calls) == 2
+    assert anthropic_client.messages.create_calls[0]["max_tokens"] == 1
+    assert anthropic_client.messages.create_calls[1]["max_tokens"] == 1

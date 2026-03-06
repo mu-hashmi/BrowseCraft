@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_chat_model: str = "claude-sonnet-4-6"
     anthropic_planner_model: str = "claude-opus-4-6"
+    anthropic_triage_model: str = "claude-3-5-haiku-latest"
     supermemory_api_key: str | None = None
 
 

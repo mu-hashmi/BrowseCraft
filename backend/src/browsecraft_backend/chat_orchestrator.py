@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 CHAT_MODEL = "claude-sonnet-4-6"
 PLANNER_MODEL = "claude-opus-4-6"
+TRIAGE_MODEL = "claude-3-5-haiku-latest"
 _DEFAULT_WORLD_ID = "default"
 _SYSTEM_PROMPT = (
     "You are BrowseCraft's Minecraft in-game assistant.\n"
@@ -67,9 +68,28 @@ _SYSTEM_PROMPT = (
     "If a placement batch is clearly wrong, call undo_last and retry with corrected coordinates.\n"
     "Use tools for factual game state instead of guessing."
 )
+_TRIAGE_SYSTEM_PROMPT = (
+    "You are a build request triage classifier for Minecraft construction commands.\n"
+    "Return strict JSON only. No prose. No markdown.\n"
+    "Schema:\n"
+    '{'
+    '"is_build_request": boolean,'
+    '"complexity": "simple" | "complex",'
+    '"spatial_reference": "absolute_coordinates" | "relative_to_player" | "relative_to_existing_structure" | "default_anchor" | "none",'
+    '"distance_hint": integer | null,'
+    '"should_undo_first": boolean'
+    '}\n'
+    "Guidelines:\n"
+    "- simple: single/small edit, one local structure tweak, short linear action.\n"
+    "- complex: multi-part structure, staged layout, or interdependent sub-builds.\n"
+    "- spatial_reference based on the user's explicit phrasing.\n"
+    "- distance_hint only for relative_to_player requests; otherwise null.\n"
+    "- should_undo_first true only if the user asks to undo/revert previous work."
+)
 _MAX_TOOL_ROUNDS = 20
 _CONTEXT_MESSAGE_LIMIT = 12
 _MAX_MODEL_OUTPUT_TOKENS = 2048
+_TRIAGE_MAX_TOKENS = 120
 _MAX_Y_DELTA_FROM_PLAYER = 96
 _DEFAULT_FORWARD_BUILD_OFFSET = 10
 _PLACE_BLOCK_BATCH_SIZE = 256
@@ -364,6 +384,20 @@ class _BuildStepPlanModel(BaseModel):
     steps: list[_BuildStepModel] = Field(min_length=1, max_length=12)
 
 
+class _BuildRequestTriageModel(BaseModel):
+    is_build_request: bool
+    complexity: Literal["simple", "complex"]
+    spatial_reference: Literal[
+        "absolute_coordinates",
+        "relative_to_player",
+        "relative_to_existing_structure",
+        "default_anchor",
+        "none",
+    ]
+    distance_hint: int | None = Field(default=None, ge=0, le=64)
+    should_undo_first: bool = False
+
+
 @dataclass(slots=True, frozen=True)
 class _BuildAnchor:
     x: int
@@ -537,6 +571,7 @@ class ChatOrchestrator:
         websocket_manager: WebSocketManager,
         chat_model: str = CHAT_MODEL,
         planner_model: str = PLANNER_MODEL,
+        triage_model: str = TRIAGE_MODEL,
         anthropic_client_factory: AnthropicClientFactory | None = None,
         convex_client: ConvexHttpClient | None = None,
         supermemory_client: SupermemoryClientProtocol | None = None,
@@ -544,6 +579,7 @@ class ChatOrchestrator:
         self._anthropic_api_key = anthropic_api_key
         self._chat_model = chat_model
         self._planner_model = planner_model
+        self._triage_model = triage_model
         self._websocket_manager = websocket_manager
         self._anthropic_client_factory = anthropic_client_factory or (lambda api_key: AsyncAnthropic(api_key=api_key))
         self._convex_client = convex_client
@@ -629,6 +665,19 @@ class ChatOrchestrator:
                         }
                     ],
                     tools=_CACHEABLE_TOOL_SCHEMAS,
+                    messages=[{"role": "user", "content": "warmup"}],
+                )
+                await client.messages.create(
+                    model=self._triage_model,
+                    max_tokens=1,
+                    temperature=0,
+                    system=[
+                        {
+                            "type": "text",
+                            "text": _TRIAGE_SYSTEM_PROMPT,
+                            "cache_control": _CACHE_CONTROL_EPHEMERAL,
+                        }
+                    ],
                     messages=[{"role": "user", "content": "warmup"}],
                 )
                 self._warmup_done = True
@@ -755,29 +804,31 @@ class ChatOrchestrator:
             world_id=world_id,
             user_message=user_message,
         )
-        anchor_distance = _DEFAULT_FORWARD_BUILD_OFFSET
-        if _is_directly_in_front_request(user_message):
-            anchor_distance = 1
-        build_anchor = _forward_build_anchor(
-            player_position=player_position,
-            distance=anchor_distance,
-        )
-        if _is_directly_in_front_request(user_message):
-            build_anchor = _BuildAnchor(
-                x=build_anchor.x,
-                y=player_position.block_y,
-                z=build_anchor.z,
-            )
-        system_prompt = _compose_system_prompt(
-            request_mode=request_mode,
-            player_position=player_position,
-            build_anchor=build_anchor,
-            memory_context=memory_context,
-        )
-
         client = self._anthropic_client_factory(self._anthropic_api_key)
         try:
-            if request_mode == "build" and _has_undo_request(user_message):
+            triage: _BuildRequestTriageModel | None = None
+            if request_mode == "build":
+                await self._emit_tool_status(client_id=client_id, status="⚡ Classifying request...")
+                triage = await self._triage_build_request(
+                    client=client,
+                    user_message=user_message,
+                    conversation_messages=base_messages,
+                    player_position=player_position,
+                )
+
+            build_anchor = _build_anchor_for_request(
+                player_position=player_position,
+                triage=triage,
+            )
+            system_prompt = _compose_system_prompt(
+                request_mode=request_mode,
+                player_position=player_position,
+                build_anchor=build_anchor,
+                memory_context=memory_context,
+                triage=triage,
+            )
+
+            if request_mode == "build" and triage is not None and triage.is_build_request and triage.should_undo_first:
                 await self._emit_tool_status(client_id=client_id, status="↩ Undoing previous placement...")
                 undo_result = await self._execute_tool(
                     client_id=client_id,
@@ -792,7 +843,7 @@ class ChatOrchestrator:
                 if undo_result.is_error:
                     raise RuntimeError(f"undo_last failed: {undo_result.content}")
 
-            if request_mode == "build" and _has_build_intent(user_message):
+            if request_mode == "build" and triage is not None and triage.is_build_request and triage.complexity == "complex":
                 await self._emit_tool_status(client_id=client_id, status="🧠 Drafting step plan...")
                 planned_steps = await self._plan_build_steps(
                     client=client,
@@ -803,7 +854,8 @@ class ChatOrchestrator:
                     player_position=player_position,
                     build_anchor=build_anchor,
                 )
-                previous_step_outcomes: list[str] = []
+                previous_step_outcomes: list[dict[str, Any]] = []
+                step_messages = [*base_messages]
                 final_response = ""
                 for step_index, step in enumerate(planned_steps, start=1):
                     await self._emit_tool_status(
@@ -817,9 +869,10 @@ class ChatOrchestrator:
                         total_steps=len(planned_steps),
                         previous_step_outcomes=previous_step_outcomes,
                     )
+                    step_messages.append({"role": "user", "content": step_message})
                     for attempt in range(_MAX_STEP_RETRIES + 1):
                         try:
-                            final_response, _ = await self._execute_tool_loop(
+                            final_response, _, step_tool_outcomes = await self._execute_tool_loop(
                                 client=client,
                                 model=self._chat_model,
                                 client_id=client_id,
@@ -829,7 +882,7 @@ class ChatOrchestrator:
                                 player_position=player_position,
                                 request_mode="build",
                                 system_prompt=system_prompt,
-                                messages=[*base_messages, {"role": "user", "content": step_message}],
+                                messages=step_messages,
                                 force_tool_use=True,
                                 require_build_modification=False,
                                 enforce_build_intent=True,
@@ -844,7 +897,13 @@ class ChatOrchestrator:
                                 client_id=client_id,
                                 status=f"↻ Retrying step '{step.name}'...",
                             )
-                    previous_step_outcomes.append(f"{step.name}: {final_response}")
+                    previous_step_outcomes.append(
+                        {
+                            "step_name": step.name,
+                            "assistant_response": final_response,
+                            "tool_outcomes": step_tool_outcomes,
+                        }
+                    )
                 return final_response
 
             if request_mode == "plan":
@@ -852,7 +911,11 @@ class ChatOrchestrator:
             elif request_mode == "plan_fast":
                 await self._emit_tool_status(client_id=client_id, status="🎨 Designing structure preview...")
             messages = [*base_messages, {"role": "user", "content": user_message}]
-            assistant_text, _ = await self._execute_tool_loop(
+            force_tool_use = _is_preview_mode(request_mode) or (
+                request_mode == "build" and triage is not None and triage.is_build_request
+            )
+            enforce_build_intent = request_mode == "build" and triage is not None and triage.is_build_request
+            assistant_text, _, _ = await self._execute_tool_loop(
                 client=client,
                 model=self._chat_model,
                 client_id=client_id,
@@ -863,13 +926,60 @@ class ChatOrchestrator:
                 request_mode=request_mode,
                 system_prompt=system_prompt,
                 messages=messages,
-                force_tool_use=_is_preview_mode(request_mode) or (request_mode == "build" and _has_build_intent(user_message)),
+                force_tool_use=force_tool_use,
                 require_build_modification=False,
-                enforce_build_intent=(request_mode == "build" and _has_build_intent(user_message)),
+                enforce_build_intent=enforce_build_intent,
             )
             return assistant_text
         finally:
             await client.close()
+
+    async def _triage_build_request(
+        self,
+        *,
+        client: AsyncAnthropic,
+        user_message: str,
+        conversation_messages: list[dict[str, Any]],
+        player_position: _PlayerPositionResult,
+    ) -> _BuildRequestTriageModel:
+        recent_messages = conversation_messages[-6:]
+        history_lines: list[str] = []
+        for message in recent_messages:
+            role = message.get("role")
+            content = message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, str):
+                continue
+            history_lines.append(f"{role}: {content}")
+        history_text = "\n".join(history_lines) if history_lines else "(none)"
+
+        triage_user_prompt = (
+            f"Conversation context:\n{history_text}\n"
+            f"Current user request:\n{user_message}\n"
+            "Locked player snapshot:\n"
+            f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
+            f"- facing={player_position.facing}\n"
+            "Return JSON only."
+        )
+
+        try:
+            response = await client.messages.create(
+                model=self._triage_model,
+                max_tokens=_TRIAGE_MAX_TOKENS,
+                temperature=0,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _TRIAGE_SYSTEM_PROMPT,
+                        "cache_control": _CACHE_CONTROL_EPHEMERAL,
+                    }
+                ],
+                messages=[{"role": "user", "content": triage_user_prompt}],
+            )
+            triage_text = _extract_text_from_message_content(getattr(response, "content", []))
+            return _parse_build_request_triage(triage_text)
+        except Exception:
+            logger.warning("Build triage classification failed; using fallback", exc_info=True)
+            return _fallback_build_request_triage(user_message)
 
     async def _plan_build_steps(
         self,
@@ -936,11 +1046,12 @@ class ChatOrchestrator:
         force_tool_use: bool,
         require_build_modification: bool,
         enforce_build_intent: bool,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, list[dict[str, Any]]]:
         mode_tool_schemas = _tool_schemas_for_mode(request_mode)
         tool_rounds = 0
         no_tool_retries = 0
         applied_build_modification = False
+        recorded_tool_outcomes: list[dict[str, Any]] = []
         while True:
             _summarize_historical_tool_results(messages)
             tool_choice = _tool_choice_for_round(
@@ -983,7 +1094,7 @@ class ChatOrchestrator:
                     continue
                 if require_build_modification and not applied_build_modification:
                     raise RuntimeError("Step completed without any world-modifying tool calls")
-                return assistant_text, applied_build_modification
+                return assistant_text, applied_build_modification, recorded_tool_outcomes
 
             force_tool_use = False
             tool_rounds += 1
@@ -1023,10 +1134,21 @@ class ChatOrchestrator:
                 if execution.is_error:
                     tool_result["is_error"] = True
                 tool_results.append(tool_result)
+                outcome: dict[str, Any] = {
+                    "tool_name": tool_use["name"],
+                    "is_error": execution.is_error,
+                    "input": tool_use["input"],
+                }
+                parsed_content = _parse_json_object_maybe(execution.content)
+                if parsed_content is not None:
+                    outcome["result"] = parsed_content
+                else:
+                    outcome["result"] = execution.content
+                recorded_tool_outcomes.append(outcome)
 
             messages.append({"role": "user", "content": tool_results})
             if _is_preview_mode(request_mode) and set_plan_succeeded:
-                return "Preview loaded. Reposition if needed, then confirm to place.", applied_build_modification
+                return "Preview loaded. Reposition if needed, then confirm to place.", applied_build_modification, recorded_tool_outcomes
 
     async def _run_model_round(
         self,
@@ -1514,8 +1636,44 @@ def _extract_text_response(assistant_blocks: list[dict[str, Any]]) -> str:
     return full_text
 
 
-def _has_build_intent(message: str) -> bool:
-    lowered = message.lower()
+def _extract_text_from_message_content(content_blocks: list[Any]) -> str:
+    chunks: list[str] = []
+    for block in content_blocks:
+        if getattr(block, "type", None) != "text":
+            continue
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            chunks.append(text)
+    return "".join(chunks).strip()
+
+
+def _extract_json_payload(raw_text: str) -> dict[str, Any]:
+    payload = raw_text.strip()
+    if payload.startswith("```"):
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start >= 0 and end >= 0:
+            payload = payload[start:end + 1]
+    try:
+        parsed_json = json.loads(payload)
+    except json.JSONDecodeError:
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start < 0 or end < 0:
+            raise
+        parsed_json = json.loads(payload[start:end + 1])
+    if not isinstance(parsed_json, dict):
+        raise ValueError("Expected JSON object")
+    return parsed_json
+
+
+def _parse_build_request_triage(raw_text: str) -> _BuildRequestTriageModel:
+    parsed_json = _extract_json_payload(raw_text)
+    return _BuildRequestTriageModel.model_validate(parsed_json)
+
+
+def _fallback_build_request_triage(user_message: str) -> _BuildRequestTriageModel:
+    lowered = user_message.lower()
     markers = (
         "build ",
         "make ",
@@ -1527,18 +1685,48 @@ def _has_build_intent(message: str) -> bool:
         "remove ",
         "fill ",
         "put ",
+        "undo",
+        "revert",
     )
-    return any(marker in lowered for marker in markers)
+    is_build_request = any(marker in lowered for marker in markers)
+    return _BuildRequestTriageModel(
+        is_build_request=is_build_request,
+        complexity="complex" if is_build_request else "simple",
+        spatial_reference="default_anchor" if is_build_request else "none",
+        distance_hint=None,
+        should_undo_first=("undo" in lowered or "revert" in lowered),
+    )
 
 
-def _has_undo_request(message: str) -> bool:
-    lowered = message.lower()
-    return "undo" in lowered or "revert" in lowered
+def _build_anchor_for_request(
+    *,
+    player_position: _PlayerPositionResult,
+    triage: _BuildRequestTriageModel | None,
+) -> _BuildAnchor:
+    distance = _DEFAULT_FORWARD_BUILD_OFFSET
+    if triage is not None and triage.spatial_reference == "relative_to_player" and triage.distance_hint is not None:
+        distance = triage.distance_hint
+    build_anchor = _forward_build_anchor(
+        player_position=player_position,
+        distance=distance,
+    )
+    if triage is not None and triage.spatial_reference == "relative_to_player":
+        return _BuildAnchor(
+            x=build_anchor.x,
+            y=player_position.block_y,
+            z=build_anchor.z,
+        )
+    return build_anchor
 
 
-def _is_directly_in_front_request(message: str) -> bool:
-    lowered = message.lower()
-    return "directly in front of me" in lowered or "right in front of me" in lowered
+def _parse_json_object_maybe(content: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
 
 
 def _is_preview_mode(request_mode: Literal["build", "plan", "plan_fast"]) -> bool:
@@ -1579,6 +1767,7 @@ def _compose_system_prompt(
     player_position: _PlayerPositionResult,
     build_anchor: _BuildAnchor,
     memory_context: str,
+    triage: _BuildRequestTriageModel | None,
 ) -> str:
     system_prompt = (
         f"{_SYSTEM_PROMPT}\n"
@@ -1593,6 +1782,16 @@ def _compose_system_prompt(
         "For new structures, center around this build anchor. "
         "Only ignore this when the user gives explicit coordinates or requests edits to an existing structure."
     )
+    if triage is not None:
+        system_prompt = (
+            f"{system_prompt}\n"
+            "Request triage for this turn:\n"
+            f"- is_build_request={triage.is_build_request}\n"
+            f"- complexity={triage.complexity}\n"
+            f"- spatial_reference={triage.spatial_reference}\n"
+            f"- distance_hint={triage.distance_hint}\n"
+            f"- should_undo_first={triage.should_undo_first}"
+        )
     if memory_context:
         return (
             f"{system_prompt}\n"
@@ -1627,11 +1826,11 @@ def _step_execution_message(
     step: _BuildStepModel,
     step_index: int,
     total_steps: int,
-    previous_step_outcomes: list[str],
+    previous_step_outcomes: list[dict[str, Any]],
 ) -> str:
     prior = "none"
     if previous_step_outcomes:
-        prior = "\n".join(f"- {line}" for line in previous_step_outcomes)
+        prior = json.dumps(previous_step_outcomes[-4:], sort_keys=True)
     return (
         f"Original user request: {original_request}\n"
         f"Execute step {step_index}/{total_steps}.\n"
@@ -1641,6 +1840,7 @@ def _step_execution_message(
         f"Success check: {step.success_check}\n"
         "Completed steps so far:\n"
         f"{prior}\n"
+        "Use prior tool outcome data (coordinates, anchors, bbox) when building dependent follow-up steps.\n"
         "Modify the world now and keep changes from earlier steps."
     )
 

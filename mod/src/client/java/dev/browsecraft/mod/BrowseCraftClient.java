@@ -18,7 +18,6 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.util.ScreenshotRecorder;
-import net.minecraft.client.util.Window;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
@@ -31,6 +30,8 @@ import net.minecraft.util.WorldSavePath;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWCharCallbackI;
+import org.lwjgl.glfw.GLFWKeyCallbackI;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -122,7 +123,8 @@ public final class BrowseCraftClient implements ClientModInitializer {
     private int inventoryPollCountdown;
     private volatile String latestStatusMessage = "";
     private final HudChatState hudChatState = new HudChatState();
-    private final Map<Integer, Boolean> hudKeyPressedState = new HashMap<>();
+    private GLFWKeyCallbackI previousKeyCallback;
+    private GLFWCharCallbackI previousCharCallback;
     private final List<ChatMessage> chatHistory = new ArrayList<>();
     private String activeToolStatus = "";
     private boolean assistantStreaming;
@@ -178,6 +180,7 @@ public final class BrowseCraftClient implements ClientModInitializer {
         );
 
         registerKeyBindings();
+        registerHudInputCallbacks();
         registerCommands();
         registerClientTick();
         registerHudRenderer();
@@ -314,10 +317,6 @@ public final class BrowseCraftClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (openChatKey.wasPressed()) {
                 hudChatState.cycleMode();
-                hudKeyPressedState.clear();
-            }
-            if (hudChatState.mode() == HudChatState.Mode.INPUT) {
-                handleHudInput(client);
             }
 
             if (client.player == null || client.world == null) {
@@ -410,7 +409,6 @@ public final class BrowseCraftClient implements ClientModInitializer {
 
     private void openHudInput(String prefill) {
         hudChatState.openInput(prefill);
-        hudKeyPressedState.clear();
     }
 
     private void submitChatFromHud(String message) {
@@ -448,113 +446,65 @@ public final class BrowseCraftClient implements ClientModInitializer {
         return activeToolStatus;
     }
 
-    private void handleHudInput(MinecraftClient client) {
-        Window window = client.getWindow();
-        boolean shiftDown = InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT_SHIFT)
-                || InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT_SHIFT);
+    private void registerHudInputCallbacks() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> {
+            long windowHandle = client.getWindow().getHandle();
+            previousKeyCallback = GLFW.glfwSetKeyCallback(windowHandle, (window, key, scancode, action, mods) -> {
+                GLFWKeyCallbackI chained = previousKeyCallback;
+                if (chained != null) {
+                    chained.invoke(window, key, scancode, action, mods);
+                }
+                client.execute(() -> onHudKeyInput(client, key, action));
+            });
+            previousCharCallback = GLFW.glfwSetCharCallback(windowHandle, (window, codepoint) -> {
+                GLFWCharCallbackI chained = previousCharCallback;
+                if (chained != null) {
+                    chained.invoke(window, codepoint);
+                }
+                client.execute(() -> onHudCharInput(client, codepoint));
+            });
+        });
+    }
 
-        if (wasPressedThisTick(window, GLFW.GLFW_KEY_ESCAPE)) {
-            hudChatState.cancelInput();
-            hudKeyPressedState.clear();
+    private void onHudKeyInput(MinecraftClient client, int key, int action) {
+        if (hudChatState.mode() != HudChatState.Mode.INPUT) {
             return;
         }
-        if (wasPressedThisTick(window, GLFW.GLFW_KEY_ENTER) || wasPressedThisTick(window, GLFW.GLFW_KEY_KP_ENTER)) {
-            String message = hudChatState.submit();
-            hudKeyPressedState.clear();
-            if (!message.isEmpty()) {
-                submitChatFromHud(message);
-            }
+        if (client.currentScreen != null) {
             return;
         }
-        if (wasPressedThisTick(window, GLFW.GLFW_KEY_BACKSPACE)) {
-            hudChatState.backspace();
-        }
-        if (wasPressedThisTick(window, GLFW.GLFW_KEY_LEFT)) {
-            hudChatState.moveLeft();
-        }
-        if (wasPressedThisTick(window, GLFW.GLFW_KEY_RIGHT)) {
-            hudChatState.moveRight();
+        if (action != GLFW.GLFW_PRESS && action != GLFW.GLFW_REPEAT) {
+            return;
         }
 
-        for (int keyCode = GLFW.GLFW_KEY_SPACE; keyCode <= GLFW.GLFW_KEY_Z; keyCode++) {
-            if (!wasPressedThisTick(window, keyCode)) {
-                continue;
+        switch (key) {
+            case GLFW.GLFW_KEY_ESCAPE -> hudChatState.cancelInput();
+            case GLFW.GLFW_KEY_ENTER, GLFW.GLFW_KEY_KP_ENTER -> {
+                String message = hudChatState.submit();
+                if (!message.isEmpty()) {
+                    submitChatFromHud(message);
+                }
             }
-            char value = keyCodeToChar(keyCode, shiftDown);
-            if (value != 0) {
-                hudChatState.insert(value);
-            }
-        }
-
-        int[] punctuationKeys = {
-                GLFW.GLFW_KEY_COMMA,
-                GLFW.GLFW_KEY_PERIOD,
-                GLFW.GLFW_KEY_SLASH,
-                GLFW.GLFW_KEY_SEMICOLON,
-                GLFW.GLFW_KEY_APOSTROPHE,
-                GLFW.GLFW_KEY_LEFT_BRACKET,
-                GLFW.GLFW_KEY_RIGHT_BRACKET,
-                GLFW.GLFW_KEY_MINUS,
-                GLFW.GLFW_KEY_EQUAL,
-                GLFW.GLFW_KEY_BACKSLASH,
-                GLFW.GLFW_KEY_GRAVE_ACCENT
-        };
-        for (int keyCode : punctuationKeys) {
-            if (!wasPressedThisTick(window, keyCode)) {
-                continue;
-            }
-            char value = keyCodeToChar(keyCode, shiftDown);
-            if (value != 0) {
-                hudChatState.insert(value);
+            case GLFW.GLFW_KEY_BACKSPACE -> hudChatState.backspace();
+            case GLFW.GLFW_KEY_LEFT -> hudChatState.moveLeft();
+            case GLFW.GLFW_KEY_RIGHT -> hudChatState.moveRight();
+            default -> {
             }
         }
     }
 
-    private boolean wasPressedThisTick(Window window, int keyCode) {
-        boolean down = InputUtil.isKeyPressed(window, keyCode);
-        boolean wasDown = hudKeyPressedState.getOrDefault(keyCode, false);
-        hudKeyPressedState.put(keyCode, down);
-        return down && !wasDown;
-    }
-
-    private char keyCodeToChar(int keyCode, boolean shifted) {
-        if (keyCode >= GLFW.GLFW_KEY_A && keyCode <= GLFW.GLFW_KEY_Z) {
-            char base = (char) ('a' + (keyCode - GLFW.GLFW_KEY_A));
-            return shifted ? Character.toUpperCase(base) : base;
+    private void onHudCharInput(MinecraftClient client, int codepoint) {
+        if (hudChatState.mode() != HudChatState.Mode.INPUT) {
+            return;
         }
-        if (keyCode >= GLFW.GLFW_KEY_0 && keyCode <= GLFW.GLFW_KEY_9) {
-            if (!shifted) {
-                return (char) ('0' + (keyCode - GLFW.GLFW_KEY_0));
-            }
-            return switch (keyCode) {
-                case GLFW.GLFW_KEY_1 -> '!';
-                case GLFW.GLFW_KEY_2 -> '@';
-                case GLFW.GLFW_KEY_3 -> '#';
-                case GLFW.GLFW_KEY_4 -> '$';
-                case GLFW.GLFW_KEY_5 -> '%';
-                case GLFW.GLFW_KEY_6 -> '^';
-                case GLFW.GLFW_KEY_7 -> '&';
-                case GLFW.GLFW_KEY_8 -> '*';
-                case GLFW.GLFW_KEY_9 -> '(';
-                case GLFW.GLFW_KEY_0 -> ')';
-                default -> 0;
-            };
+        if (client.currentScreen != null) {
+            return;
         }
-        return switch (keyCode) {
-            case GLFW.GLFW_KEY_SPACE -> ' ';
-            case GLFW.GLFW_KEY_COMMA -> shifted ? '<' : ',';
-            case GLFW.GLFW_KEY_PERIOD -> shifted ? '>' : '.';
-            case GLFW.GLFW_KEY_SLASH -> shifted ? '?' : '/';
-            case GLFW.GLFW_KEY_SEMICOLON -> shifted ? ':' : ';';
-            case GLFW.GLFW_KEY_APOSTROPHE -> shifted ? '"' : '\'';
-            case GLFW.GLFW_KEY_LEFT_BRACKET -> shifted ? '{' : '[';
-            case GLFW.GLFW_KEY_RIGHT_BRACKET -> shifted ? '}' : ']';
-            case GLFW.GLFW_KEY_MINUS -> shifted ? '_' : '-';
-            case GLFW.GLFW_KEY_EQUAL -> shifted ? '+' : '=';
-            case GLFW.GLFW_KEY_BACKSLASH -> shifted ? '|' : '\\';
-            case GLFW.GLFW_KEY_GRAVE_ACCENT -> shifted ? '~' : '`';
-            default -> 0;
-        };
+        if (!Character.isValidCodePoint(codepoint) || Character.isISOControl(codepoint)) {
+            return;
+        }
+        hudChatState.insert((char) codepoint);
     }
 
     private void renderHud(DrawContext context) {

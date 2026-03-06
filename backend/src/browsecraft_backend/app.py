@@ -47,6 +47,7 @@ def _build_chat_orchestrator(settings: Settings, ws_manager: WebSocketManager) -
         websocket_manager=ws_manager,
         chat_model=settings.anthropic_chat_model,
         planner_model=settings.anthropic_planner_model,
+        triage_model=settings.anthropic_triage_model,
     )
 
 
