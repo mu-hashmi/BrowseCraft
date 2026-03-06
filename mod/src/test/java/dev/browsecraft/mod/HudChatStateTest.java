@@ -54,4 +54,21 @@ class HudChatStateTest {
         assertEquals("", state.inputText());
         assertEquals(0, state.cursor());
     }
+
+    @Test
+    void snapshotRestorePreservesModeInputAndCursor() {
+        HudChatState state = new HudChatState();
+        state.openInput("stone wall");
+        state.moveLeft();
+        state.moveLeft();
+
+        HudChatState.Snapshot snapshot = state.snapshot();
+
+        state.cancelInput();
+        state.restore(snapshot);
+
+        assertEquals(HudChatState.Mode.INPUT, state.mode());
+        assertEquals("stone wall", state.inputText());
+        assertEquals("stone wall".length() - 2, state.cursor());
+    }
 }

@@ -6,10 +6,10 @@ Validate chat tool use and spatial behavior programmatically.
 
 ### Non-negotiables
 
-- Do not use GUI automation.
+- Do not use GUI automation unless explicitly required to validate HUD elements.
 - Do not rely on manual clicking/typing as the primary validation path.
 - Validate world reasoning and block placement behavior, not just HTTP acceptance.
-- Treat `place_blocks` + `undo_last` tool flow as the core build path.
+- Keep all world-modifying tools available during spatial validation. Evaluate spatial tests on world outcome, not on whether the model picked a preferred tool.
 
 ### Required env keys
 
@@ -19,6 +19,9 @@ Set in `backend/.env`:
 | ---------------------------------- | ----------------------------------------- |
 | `ANTHROPIC_API_KEY`                | `/chat` model reasoning + tool calls      |
 | `ANTHROPIC_CHAT_MODEL`             | chat model (default `claude-sonnet-4-6`)  |
+| `ANTHROPIC_PLANNER_MODEL`          | optional planner model override           |
+| `ANTHROPIC_TRIAGE_MODEL`           | optional triage model override            |
+| `ANTHROPIC_ENABLE_BUILD_PLANNER`   | optional plan-then-execute for build mode |
 | `CONVEX_URL` + `CONVEX_ACCESS_KEY` | optional session persistence              |
 | `SUPERMEMORY_API_KEY`              | optional long-term memory                 |
 | `LAMINAR_API_KEY`                  | optional tracing/observability            |
@@ -39,17 +42,24 @@ Run spatial tests explicitly (these are slower and cost money):
 cd ~/BrowseCraft/backend && uv run pytest -q -m spatial
 ```
 
-Use Sonnet for day-to-day iteration and Opus only for final validation:
+Default live iteration should stay Sonnet-only and planner-free unless you are explicitly validating planner behavior:
 
 ```bash
-# iteration (default)
-cd ~/BrowseCraft/backend && ANTHROPIC_CHAT_MODEL=claude-sonnet-4-6 uv run pytest -q -m spatial
+# default live pass: no Opus, no build planner, no planning tests
+cd ~/BrowseCraft/backend && ANTHROPIC_CHAT_MODEL=claude-sonnet-4-6 ANTHROPIC_PLANNER_MODEL=claude-sonnet-4-6 ANTHROPIC_TRIAGE_MODEL=claude-haiku-4-5 ANTHROPIC_ENABLE_BUILD_PLANNER=false uv run pytest -q -m spatial --quick
 
-# final validation
-cd ~/BrowseCraft/backend && ANTHROPIC_CHAT_MODEL=claude-opus-4-6 uv run pytest -q -m spatial
+# broader Sonnet-only live pass
+cd ~/BrowseCraft/backend && ANTHROPIC_CHAT_MODEL=claude-sonnet-4-6 ANTHROPIC_PLANNER_MODEL=claude-sonnet-4-6 ANTHROPIC_TRIAGE_MODEL=claude-haiku-4-5 ANTHROPIC_ENABLE_BUILD_PLANNER=false uv run pytest -q -m spatial
+
+# explicitly include planning coverage
+cd ~/BrowseCraft/backend && ANTHROPIC_CHAT_MODEL=claude-sonnet-4-6 ANTHROPIC_PLANNER_MODEL=claude-sonnet-4-6 ANTHROPIC_TRIAGE_MODEL=claude-haiku-4-5 ANTHROPIC_ENABLE_BUILD_PLANNER=true uv run pytest -q -m spatial --with-planning
+
+# only use Opus if you intentionally want planner-model coverage
+cd ~/BrowseCraft/backend && ANTHROPIC_CHAT_MODEL=claude-sonnet-4-6 ANTHROPIC_PLANNER_MODEL=claude-opus-4-6 ANTHROPIC_TRIAGE_MODEL=claude-haiku-4-5 ANTHROPIC_ENABLE_BUILD_PLANNER=true uv run pytest -q -m spatial --with-planning
 ```
 
 These tests use the headless voxel simulator (no Minecraft client required), send real `/v1/chat` requests, service real tool calls, and assert structural outcomes.
+They are for spatial correctness, not for enforcing specific tool-choice policies.
 
 ### Optional manual live run
 
@@ -62,10 +72,34 @@ cd ~/BrowseCraft/mod && gradle runClient
 
 Then run `/chat <message>` in-game.
 
+### HUD-only visual verification
+
+Use the HUD capture gametest when you need rendered screenshots of the client HUD without manual interaction:
+
+```bash
+cd ~/BrowseCraft/mod
+env JAVA_TOOL_OPTIONS='-Dbrowsecraft.clientGameTestSuite=hud' gradle runClientGameTest
+```
+
+This path is exclusively for validating HUD elements:
+- HUD mode rendering
+- INPUT mode rendering
+- text wrapping
+- panel/input layout
+- cursor placement
+- screenshot/metadata capture
+
+It is not a build validation path.
+- It does not verify planner/executor behavior.
+- It does not verify backend tool use.
+- It does not verify block placement correctness in the world.
+
+Use spatial backend tests or a real `/chat` integration run when the goal is to verify that structures build correctly.
+
 ### Iteration loop for spatial improvements
 
 1. Update system prompt/tool descriptions in `chat_orchestrator.py`.
-2. Run `uv run pytest -q -m spatial`.
+2. Run `uv run pytest -q -m spatial --quick` first. Add `--with-planning` only when you are intentionally validating planner behavior.
 3. Inspect failing scenario assertions and adjust prompt/tool behavior.
 4. Re-run until stable.
 
@@ -91,5 +125,5 @@ The JSON report includes world diff metrics, block-count/height/connectivity val
 
 - `Invalid arguments for inspect_area`: missing `center`/`radius` or malformed `detailed` flag.
 - `Exceeded max tool rounds`: model is stuck in inspect/modify loop; tighten prompt guidance.
-- Spatial assertions failing with zero placements: model did not call `place_blocks`.
+- Spatial assertions failing with zero placements: model did not call a world-modifying tool.
 - Spatial assertions failing due wrong coordinates: improve orientation/grounding instructions in the system prompt.

@@ -14,8 +14,9 @@ class Settings(BaseSettings):
     convex_access_key: str | None = None
     anthropic_api_key: str | None = None
     anthropic_chat_model: str = "claude-sonnet-4-6"
-    anthropic_planner_model: str = "claude-opus-4-6"
-    anthropic_triage_model: str = "claude-3-5-haiku-latest"
+    anthropic_planner_model: str = "claude-sonnet-4-6"
+    anthropic_triage_model: str = "claude-haiku-4-5"
+    anthropic_enable_build_planner: bool = False
     supermemory_api_key: str | None = None
 
 

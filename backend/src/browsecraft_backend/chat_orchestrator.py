@@ -30,8 +30,8 @@ from .websocket_manager import WebSocketManager
 logger = logging.getLogger(__name__)
 
 CHAT_MODEL = "claude-sonnet-4-6"
-PLANNER_MODEL = "claude-opus-4-6"
-TRIAGE_MODEL = "claude-3-5-haiku-latest"
+PLANNER_MODEL = "claude-sonnet-4-6"
+TRIAGE_MODEL = "claude-haiku-4-5"
 _DEFAULT_WORLD_ID = "default"
 _SYSTEM_PROMPT = (
     "You are BrowseCraft's Minecraft in-game assistant.\n"
@@ -49,23 +49,28 @@ _SYSTEM_PROMPT = (
     "location instructions derived from locked player_position; do not reinterpret those as the default 10-block build_anchor.\n"
     "If the user says 'directly in front of me' without a distance, use exactly one block forward from block_x/block_z.\n"
     "For immediate relative placements around the player, default vertical placement to block_y unless the user specifies y.\n"
+    "ground_y is the terrain block beneath the player. For towers, rooms, walls, pillars, platforms, and similar builds "
+    "placed at/around/in front of the player, start the build at block_y so it sits on top of the ground rather than "
+    "embedding into the ground at ground_y, unless the user explicitly asks to start from the ground block itself.\n"
     "Do not create floating structures unless explicitly requested. Ensure builds are grounded or attached.\n"
     "Before modifying existing structures, inspect first. Use inspect_area with detailed=true when position-level data is needed.\n"
     "When using detailed inspections, keep filter_terrain=true unless terrain layout is directly relevant.\n"
     "When inspecting, start with small radii (4-6). Expand radius only when strictly necessary.\n"
     "If a request references walls/faces, map orientation using coordinates: south face = max z, north face = min z, "
     "east face = max x, west face = min x.\n"
-    "For axis-aligned cuboids (walls, floors, roofs, boxes), prefer fill_region over enumerating many blocks.\n"
-    "For regular geometric structures, prefer build_geometry and keep place_blocks for details/irregular edits.\n"
+    "For supported regular shapes (boxes, cylinders, spheres, floors, walls, pillars, stairs, flat/gabled/hipped roofs), "
+    "build_geometry is often useful.\n"
+    "Keep place_blocks for detail or irregular edits, and keep fill_region for bulk cuboid edits when that is the simplest fit.\n"
     "For iterative edits, preserve existing structure and apply minimal diffs instead of rebuilding unrelated parts.\n"
     "For large custom builds, split work into multiple batches; keep each place_blocks batch reasonably small.\n"
-    "Default mode is direct building: use place_blocks/fill_region to place blocks immediately.\n"
+    "Default mode is direct building: use build_geometry, place_blocks, or fill_region to modify the world immediately.\n"
     "Use set_plan only when the user explicitly asks for a preview/blueprint/plan, "
     "or when the build is large enough that positioning first is safer.\n"
     "When the user asks for creative structures, use varied materials, depth/layering, "
     "decorative details, and stairs/slabs where appropriate so results feel hand-built.\n"
     "If the user asks to undo/revert the previous build, call undo_last before applying replacement placements.\n"
-    "If a placement batch is clearly wrong, call undo_last and retry with corrected coordinates.\n"
+    "If the latest placement batch is clearly wrong, call undo_last and retry with corrected coordinates. "
+    "Large builds and build_geometry placements may require repeated undo_last calls because execution is batched.\n"
     "Use tools for factual game state instead of guessing."
 )
 _TRIAGE_SYSTEM_PROMPT = (
@@ -374,6 +379,8 @@ class _PlayerPositionResult(BaseModel):
 
 
 class _BuildStepModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1)
     goal: str = Field(min_length=1)
     relative_location_hint: str = Field(min_length=1)
@@ -381,10 +388,14 @@ class _BuildStepModel(BaseModel):
 
 
 class _BuildStepPlanModel(BaseModel):
-    steps: list[_BuildStepModel] = Field(min_length=1, max_length=12)
+    model_config = ConfigDict(extra="forbid")
+
+    steps: list[_BuildStepModel] = Field(min_length=1, max_length=8)
 
 
 class _BuildRequestTriageModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     is_build_request: bool
     complexity: Literal["simple", "complex"]
     spatial_reference: Literal[
@@ -498,12 +509,12 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "place_blocks",
-        "description": "Place blocks at absolute world coordinates.",
+        "description": "Place blocks at absolute world coordinates for irregular or detail edits. Do not use this for supported regular shapes when build_geometry fits.",
         "input_schema": _PlaceBlocksArgs.model_json_schema(),
     },
     {
         "name": "fill_region",
-        "description": "Fill an axis-aligned cuboid region with one block type.",
+        "description": "Fill an axis-aligned cuboid region with one block type for bulk cuboid edits. Do not use this for supported regular shapes when build_geometry fits.",
         "input_schema": _FillRegionArgs.model_json_schema(),
     },
     {
@@ -511,7 +522,7 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Build deterministic regular shapes around an anchor (box, cylinder, sphere, floor, wall, pillar, stairs, flat/gabled/hipped roofs). "
             "Anchor is the center with negative-bias centering for even sizes. "
-            "Use rotation for cardinal orientation. Prefer this tool for regular geometry."
+            "Use rotation for cardinal orientation. Use this tool for supported regular geometry even when dimensions must be derived from corners or existing bounds."
         ),
         "input_schema": _BUILD_GEOMETRY_TOOL_SCHEMA,
     },
@@ -522,7 +533,7 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "undo_last",
-        "description": "Undo the most recent placement batch from place_blocks.",
+        "description": "Undo the most recent placement batch. Large builds and multi-batch geometry may require repeated undo_last calls.",
         "input_schema": _NoArgs.model_json_schema(),
     },
     {
@@ -572,6 +583,7 @@ class ChatOrchestrator:
         chat_model: str = CHAT_MODEL,
         planner_model: str = PLANNER_MODEL,
         triage_model: str = TRIAGE_MODEL,
+        enable_build_planner: bool = False,
         anthropic_client_factory: AnthropicClientFactory | None = None,
         convex_client: ConvexHttpClient | None = None,
         supermemory_client: SupermemoryClientProtocol | None = None,
@@ -580,6 +592,7 @@ class ChatOrchestrator:
         self._chat_model = chat_model
         self._planner_model = planner_model
         self._triage_model = triage_model
+        self._enable_build_planner = enable_build_planner
         self._websocket_manager = websocket_manager
         self._anthropic_client_factory = anthropic_client_factory or (lambda api_key: AsyncAnthropic(api_key=api_key))
         self._convex_client = convex_client
@@ -843,7 +856,13 @@ class ChatOrchestrator:
                 if undo_result.is_error:
                     raise RuntimeError(f"undo_last failed: {undo_result.content}")
 
-            if request_mode == "build" and triage is not None and triage.is_build_request and triage.complexity == "complex":
+            if (
+                request_mode == "build"
+                and self._enable_build_planner
+                and triage is not None
+                and triage.is_build_request
+                and triage.complexity == "complex"
+            ):
                 await self._emit_tool_status(client_id=client_id, status="🧠 Drafting step plan...")
                 planned_steps = await self._plan_build_steps(
                     client=client,
@@ -855,7 +874,7 @@ class ChatOrchestrator:
                     build_anchor=build_anchor,
                 )
                 previous_step_outcomes: list[dict[str, Any]] = []
-                step_messages = [*base_messages]
+                step_history_messages = [*base_messages]
                 final_response = ""
                 for step_index, step in enumerate(planned_steps, start=1):
                     await self._emit_tool_status(
@@ -869,9 +888,10 @@ class ChatOrchestrator:
                         total_steps=len(planned_steps),
                         previous_step_outcomes=previous_step_outcomes,
                     )
-                    step_messages.append({"role": "user", "content": step_message})
+                    step_request_messages = [*step_history_messages, {"role": "user", "content": step_message}]
                     for attempt in range(_MAX_STEP_RETRIES + 1):
                         try:
+                            step_attempt_messages = [*step_request_messages]
                             final_response, _, step_tool_outcomes = await self._execute_tool_loop(
                                 client=client,
                                 model=self._chat_model,
@@ -882,11 +902,12 @@ class ChatOrchestrator:
                                 player_position=player_position,
                                 request_mode="build",
                                 system_prompt=system_prompt,
-                                messages=step_messages,
+                                messages=step_attempt_messages,
                                 force_tool_use=True,
                                 require_build_modification=False,
                                 enforce_build_intent=True,
                             )
+                            step_history_messages = step_attempt_messages
                             break
                         except Exception as exc:
                             if attempt >= _MAX_STEP_RETRIES:
@@ -961,25 +982,25 @@ class ChatOrchestrator:
             "Return JSON only."
         )
 
-        try:
-            response = await client.messages.create(
-                model=self._triage_model,
-                max_tokens=_TRIAGE_MAX_TOKENS,
-                temperature=0,
-                system=[
-                    {
-                        "type": "text",
-                        "text": _TRIAGE_SYSTEM_PROMPT,
-                        "cache_control": _CACHE_CONTROL_EPHEMERAL,
-                    }
-                ],
-                messages=[{"role": "user", "content": triage_user_prompt}],
-            )
-            triage_text = _extract_text_from_message_content(getattr(response, "content", []))
-            return _parse_build_request_triage(triage_text)
-        except Exception:
-            logger.warning("Build triage classification failed; using fallback", exc_info=True)
-            return _fallback_build_request_triage(user_message)
+        response = await client.messages.parse(
+            model=self._triage_model,
+            max_tokens=_TRIAGE_MAX_TOKENS,
+            temperature=0,
+            system=[
+                {
+                    "type": "text",
+                    "text": _TRIAGE_SYSTEM_PROMPT,
+                    "cache_control": _CACHE_CONTROL_EPHEMERAL,
+                }
+            ],
+            messages=[{"role": "user", "content": triage_user_prompt}],
+            output_format=_BuildRequestTriageModel,
+        )
+        parsed_output = response.parsed_output
+        if parsed_output is None:
+            raw_text = _extract_text_from_message_content(getattr(response, "content", []))
+            raise RuntimeError(f"Anthropic triage response did not match structured output: {raw_text}")
+        return parsed_output
 
     async def _plan_build_steps(
         self,
@@ -995,7 +1016,7 @@ class ChatOrchestrator:
         planner_system_prompt = (
             "You are a Minecraft build planner. "
             "Decompose the request into concrete, ordered build steps. "
-            "Return strict JSON only with this schema: "
+            "Return strict JSON only with this exact schema and no extra keys: "
             '{"steps":[{"name":"...","goal":"...","relative_location_hint":"...","success_check":"..."}]}. '
             "Each step must represent physical world modifications."
         )
@@ -1241,7 +1262,6 @@ class ChatOrchestrator:
                 ),
                 is_error=True,
             )
-
         try:
             params = _validate_tool_args(tool_name, raw_input)
         except (ValidationError, ValueError) as exc:
@@ -1648,20 +1668,7 @@ def _extract_text_from_message_content(content_blocks: list[Any]) -> str:
 
 
 def _extract_json_payload(raw_text: str) -> dict[str, Any]:
-    payload = raw_text.strip()
-    if payload.startswith("```"):
-        start = payload.find("{")
-        end = payload.rfind("}")
-        if start >= 0 and end >= 0:
-            payload = payload[start:end + 1]
-    try:
-        parsed_json = json.loads(payload)
-    except json.JSONDecodeError:
-        start = payload.find("{")
-        end = payload.rfind("}")
-        if start < 0 or end < 0:
-            raise
-        parsed_json = json.loads(payload[start:end + 1])
+    parsed_json = json.loads(raw_text.strip())
     if not isinstance(parsed_json, dict):
         raise ValueError("Expected JSON object")
     return parsed_json
@@ -1670,32 +1677,6 @@ def _extract_json_payload(raw_text: str) -> dict[str, Any]:
 def _parse_build_request_triage(raw_text: str) -> _BuildRequestTriageModel:
     parsed_json = _extract_json_payload(raw_text)
     return _BuildRequestTriageModel.model_validate(parsed_json)
-
-
-def _fallback_build_request_triage(user_message: str) -> _BuildRequestTriageModel:
-    lowered = user_message.lower()
-    markers = (
-        "build ",
-        "make ",
-        "create ",
-        "construct ",
-        "place ",
-        "add ",
-        "replace ",
-        "remove ",
-        "fill ",
-        "put ",
-        "undo",
-        "revert",
-    )
-    is_build_request = any(marker in lowered for marker in markers)
-    return _BuildRequestTriageModel(
-        is_build_request=is_build_request,
-        complexity="complex" if is_build_request else "simple",
-        spatial_reference="default_anchor" if is_build_request else "none",
-        distance_hint=None,
-        should_undo_first=("undo" in lowered or "revert" in lowered),
-    )
 
 
 def _build_anchor_for_request(
@@ -1769,18 +1750,43 @@ def _compose_system_prompt(
     memory_context: str,
     triage: _BuildRequestTriageModel | None,
 ) -> str:
+    if triage is not None and triage.spatial_reference == "relative_to_player":
+        player_position_context = (
+            "Locked player position for this request (captured at submit time, authoritative):\n"
+            f"- x={player_position.x:.3f}, y={player_position.y:.3f}, z={player_position.z:.3f}\n"
+            f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
+            f"- facing={player_position.facing}, dimension={player_position.dimension}\n"
+            f"- standing_level_y={player_position.block_y}\n"
+        )
+    else:
+        player_position_context = (
+            "Locked player position for this request (captured at submit time, authoritative):\n"
+            f"- x={player_position.x:.3f}, y={player_position.y:.3f}, z={player_position.z:.3f}\n"
+            f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
+            f"- ground_y={player_position.ground_y}\n"
+            f"- facing={player_position.facing}, dimension={player_position.dimension}\n"
+        )
+
+    if triage is not None and triage.spatial_reference == "relative_to_player":
+        anchor_context = (
+            "Derived relative-to-player anchor for this request:\n"
+            f"- build_anchor_x={build_anchor.x}, build_anchor_y={build_anchor.y}, build_anchor_z={build_anchor.z}\n"
+            "Use this as the explicit target/base location for unspecified relative coordinates in this request. "
+            "This anchor is not the terrain block beneath the player."
+        )
+    else:
+        anchor_context = (
+            "Default build anchor for NEW structures in this request (10 blocks ahead of player facing):\n"
+            f"- build_anchor_x={build_anchor.x}, build_anchor_y={build_anchor.y}, build_anchor_z={build_anchor.z}\n"
+            "For new structures, center around this build anchor. "
+            "Only ignore this when the user gives explicit coordinates or requests edits to an existing structure."
+        )
+
     system_prompt = (
         f"{_SYSTEM_PROMPT}\n"
         f"Request mode for this turn: {request_mode.upper()}.\n"
-        "Locked player position for this request (captured at submit time, authoritative):\n"
-        f"- x={player_position.x:.3f}, y={player_position.y:.3f}, z={player_position.z:.3f}\n"
-        f"- block_x={player_position.block_x}, block_y={player_position.block_y}, block_z={player_position.block_z}\n"
-        f"- ground_y={player_position.ground_y}\n"
-        f"- facing={player_position.facing}, dimension={player_position.dimension}\n"
-        "Default build anchor for NEW structures in this request (10 blocks ahead of player facing):\n"
-        f"- build_anchor_x={build_anchor.x}, build_anchor_y={build_anchor.y}, build_anchor_z={build_anchor.z}\n"
-        "For new structures, center around this build anchor. "
-        "Only ignore this when the user gives explicit coordinates or requests edits to an existing structure."
+        f"{player_position_context}"
+        f"{anchor_context}"
     )
     if triage is not None:
         system_prompt = (
@@ -1792,6 +1798,18 @@ def _compose_system_prompt(
             f"- distance_hint={triage.distance_hint}\n"
             f"- should_undo_first={triage.should_undo_first}"
         )
+    if triage is not None and triage.spatial_reference == "relative_to_player":
+        system_prompt = (
+            f"{system_prompt}\n"
+            "Relative-to-player placement rule for this turn:\n"
+            f"- Use block_y={player_position.block_y} as the bottom/start level for structures placed at or around the player unless the user explicitly says to start from the ground block.\n"
+            "- For an N-block-tall structure placed relative to the player, the vertical span is block_y through block_y+N-1 unless the user specifies otherwise."
+        )
+        if player_position.ground_y is not None:
+            system_prompt = (
+                f"{system_prompt}\n"
+                f"- Example for this request: a 3-block-tall tower directly in front of the player should span y={player_position.block_y},{player_position.block_y + 1},{player_position.block_y + 2}; do not place the bottom block at ground_y={player_position.ground_y}."
+            )
     if memory_context:
         return (
             f"{system_prompt}\n"
@@ -1802,22 +1820,7 @@ def _compose_system_prompt(
 
 
 def _parse_build_step_plan(raw_text: str) -> _BuildStepPlanModel:
-    payload = raw_text.strip()
-    if payload.startswith("```"):
-        start = payload.find("{")
-        end = payload.rfind("}")
-        if start < 0 or end < 0:
-            raise ValueError("Planner response did not contain a JSON object")
-        payload = payload[start:end + 1]
-    try:
-        parsed_json = json.loads(payload)
-    except json.JSONDecodeError:
-        start = payload.find("{")
-        end = payload.rfind("}")
-        if start < 0 or end < 0:
-            raise
-        parsed_json = json.loads(payload[start:end + 1])
-    return _BuildStepPlanModel.model_validate(parsed_json)
+    return _BuildStepPlanModel.model_validate(_extract_json_payload(raw_text))
 
 
 def _step_execution_message(

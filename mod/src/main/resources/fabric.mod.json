@@ -11,7 +11,8 @@
       "dev.browsecraft.mod.BrowseCraftClient"
     ],
     "fabric-client-gametest": [
-      "dev.browsecraft.mod.BrowseCraftClientGameTests"
+      "dev.browsecraft.mod.BrowseCraftClientGameTests",
+      "dev.browsecraft.mod.BrowseCraftHudClientGameTests"
     ]
   },
   "depends": {
