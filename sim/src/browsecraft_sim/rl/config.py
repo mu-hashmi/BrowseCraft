@@ -23,10 +23,10 @@ class RewardConfig(BaseModel):
         default_factory=lambda: {
             "t1_absolute": 1,
             "t2_relative_single_ref": 2,
-            "t3_primitives": 4,
-            "t4_structure_relative": 6,
-            "t5_modification": 7,
-            "t6_composition": 9,
+            "t3_primitives": 2,
+            "t4_structure_relative": 4,
+            "t5_modification": 8,
+            "t6_composition": 8,
         }
     )
 

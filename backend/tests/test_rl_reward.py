@@ -85,7 +85,11 @@ def test_load_reward_config_applies_overrides(tmp_path) -> None:
     assert loaded.efficiency_min_correctness == 0.2
 
 
-def test_default_expected_tool_call_budgets_tighten_t1_t2() -> None:
+def test_default_expected_tool_call_budgets_match_calibrated_p75s() -> None:
     config = RewardConfig()
     assert config.expected_tool_calls_by_tier["t1_absolute"] == 1
     assert config.expected_tool_calls_by_tier["t2_relative_single_ref"] == 2
+    assert config.expected_tool_calls_by_tier["t3_primitives"] == 2
+    assert config.expected_tool_calls_by_tier["t4_structure_relative"] == 4
+    assert config.expected_tool_calls_by_tier["t5_modification"] == 8
+    assert config.expected_tool_calls_by_tier["t6_composition"] == 8

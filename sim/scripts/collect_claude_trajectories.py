@@ -6,6 +6,7 @@ import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from anthropic import AsyncAnthropic
@@ -286,6 +287,35 @@ async def _run_episode(
     }
 
 
+def _append_row(output: Path, row: dict[str, Any]) -> None:
+    with output.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+
+def _episode_progress_line(
+    *,
+    completed: int,
+    total: int,
+    row: dict[str, Any],
+    started_at: float,
+    usage_totals: dict[str, int],
+) -> str:
+    trace = row["trace"]
+    grader = row["grader"]
+    task_id = str(trace["task_id"])
+    _, family, _, _ = task_id.split(":", 3)
+    tool_calls = int(trace["tool_call_count"])
+    reward = float(row["reward_normalized"])
+    format_valid = bool(trace["format_valid"])
+    elapsed_s = monotonic() - started_at
+    return (
+        f"[{completed}/{total}] {trace['tier']}/{family} "
+        f"reward={reward:.3f} calls={tool_calls} format={int(format_valid)} "
+        f"correctness={grader['correctness']:.3f} elapsed={elapsed_s:.1f}s "
+        f"usage=in:{usage_totals['input_tokens']} out:{usage_totals['output_tokens']}"
+    )
+
+
 async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -295,9 +325,13 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     reward_config = RewardConfig()
     tasks = generate_tasks(seed=args.seed, per_tier=args.per_tier)
+    output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("", encoding="utf-8")
     client = AsyncAnthropic(api_key=api_key)
     semaphore = asyncio.Semaphore(args.concurrency)
     await _warmup_prompt_cache(client, model=args.model)
+    started_at = monotonic()
 
     async def run_one(task: Any) -> dict[str, Any]:
         async with semaphore:
@@ -310,7 +344,31 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
             )
 
     try:
-        rows = await asyncio.gather(*(run_one(task) for task in tasks))
+        rows: list[dict[str, Any]] = []
+        usage_totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+        pending = [asyncio.create_task(run_one(task)) for task in tasks]
+        for completed, done in enumerate(asyncio.as_completed(pending), start=1):
+            row = await done
+            rows.append(row)
+            _append_row(output, row)
+            for key in usage_totals:
+                usage_totals[key] += int(row["usage"][key])
+            if completed == 1 or completed % args.log_every == 0 or completed == len(tasks):
+                print(
+                    _episode_progress_line(
+                        completed=completed,
+                        total=len(tasks),
+                        row=row,
+                        started_at=started_at,
+                        usage_totals=usage_totals,
+                    ),
+                    flush=True,
+                )
         return rows
     finally:
         await client.close()
@@ -324,17 +382,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rounds", type=int, default=12)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--output", default="raw_episodes.jsonl")
+    parser.add_argument("--log-every", type=int, default=1)
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.log_every <= 0:
+        raise ValueError("--log-every must be > 0")
     rows = asyncio.run(_run(args))
     output = Path(args.output).resolve()
-    output.write_text(
-        "\n".join(json.dumps(row) for row in rows) + ("\n" if rows else ""),
-        encoding="utf-8",
-    )
     usage_totals = {
         "input_tokens": sum(row["usage"]["input_tokens"] for row in rows),
         "output_tokens": sum(row["usage"]["output_tokens"] for row in rows),
