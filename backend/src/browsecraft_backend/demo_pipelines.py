@@ -292,7 +292,8 @@ async def _discover_candidates_with_playwright(query: str) -> list[_SearchCandid
                 if (!href || !href.includes('/project/')) continue;
                 if (seen.has(href)) continue;
                 seen.add(href);
-                const text = (anchor.textContent || '').trim();
+                const text = (anchor.textContent || anchor.getAttribute('title') || '').trim();
+                if (!text) continue;
                 rows.push({ href, text });
                 if (rows.length >= 10) break;
               }
@@ -326,7 +327,8 @@ async def _download_candidate_with_playwright(candidate: _SearchCandidate) -> _D
 
             downloaded = await _attempt_playwright_download(page, candidate, temp_path)
             if downloaded is None:
-                if _looks_like_login_gate(html):
+                refreshed_html = await page.content()
+                if _looks_like_login_gate(refreshed_html):
                     raise RuntimeError("Login required to download schematic from Planet Minecraft")
                 raise RuntimeError("Unable to find a downloadable schematic on the project page")
 
@@ -354,19 +356,20 @@ async def _attempt_playwright_download(page: Any, candidate: _SearchCandidate, t
         count = await locator.count()
         if count <= 0:
             continue
-        try:
-            async with page.expect_download(timeout=8_000) as download_info:
-                await locator.first.click(timeout=4_000)
-            download = await download_info.value
-        except Exception:
-            continue
+        for index in range(count):
+            try:
+                async with page.expect_download(timeout=8_000) as download_info:
+                    await locator.nth(index).click(timeout=4_000)
+                download = await download_info.value
+            except Exception:
+                continue
 
-        suggested = _filename_from_url(download.suggested_filename)
-        if not _has_allowed_extension(suggested):
-            continue
-        destination = target_dir / suggested
-        await download.save_as(str(destination))
-        return destination
+            suggested = _filename_from_url(download.suggested_filename)
+            if not _has_allowed_extension(suggested):
+                continue
+            destination = target_dir / suggested
+            await download.save_as(str(destination))
+            return destination
 
     direct_url = await _first_direct_schematic_url(page)
     if direct_url is None:

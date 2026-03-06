@@ -29,6 +29,11 @@ public final class BrowseCraftClientGameTests implements FabricClientGameTest {
 
     @Override
     public void runTest(ClientGameTestContext context) {
+        String suite = System.getProperty("browsecraft.clientGameTestSuite");
+        if ("hud".equals(suite)) {
+            return;
+        }
+
         TestSingleplayerContext singleplayer = context.worldBuilder().create();
         context.waitTicks(40);
 

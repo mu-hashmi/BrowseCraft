@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 import os
+from queue import Empty, Queue
+from threading import Event, Thread
 from typing import Any
 
 import pytest
@@ -14,6 +16,7 @@ from browsecraft_sim.main import HeadlessVoxelWorld, PlayerState, world_bounding
 
 pytestmark = pytest.mark.spatial
 Coord = tuple[int, int, int]
+_CHAT_EVENT_TIMEOUT_SECONDS = 30.0
 
 
 def _dispatch_tool(world: HeadlessVoxelWorld, tool: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -100,54 +103,87 @@ def _run_chat_round_trip(
     max_events: int = 600,
     tool_requests: list[str] | None = None,
     tool_request_payloads: list[tuple[str, dict[str, Any]]] | None = None,
+    tool_statuses: list[str] | None = None,
 ) -> str:
-    response = client.post(
-        "/v1/chat",
-        json={
-            "client_id": client_id,
-            "message": message,
-            "mode": mode,
-        },
-    )
-    response.raise_for_status()
-    chat_id = response.json()["chat_id"]
+    event_queue: Queue[dict[str, Any]] = Queue()
+    stop_event = Event()
 
-    for _ in range(max_events):
-        envelope = websocket.receive_json()
-        event_type = envelope.get("type")
+    def websocket_loop() -> None:
+        try:
+            while not stop_event.is_set():
+                envelope = websocket.receive_json()
+                event_type = envelope.get("type")
 
-        if event_type == "tool.request":
-            request_id = envelope["request_id"]
-            tool = envelope["tool"]
-            params = envelope.get("params", {})
-            if tool_requests is not None:
-                tool_requests.append(str(tool))
-            if tool_request_payloads is not None:
-                tool_request_payloads.append((str(tool), params))
+                if event_type == "tool.request":
+                    request_id = envelope["request_id"]
+                    tool = envelope["tool"]
+                    params = envelope.get("params", {})
+                    if tool_requests is not None:
+                        tool_requests.append(str(tool))
+                    if tool_request_payloads is not None:
+                        tool_request_payloads.append((str(tool), params))
+                    try:
+                        result = _dispatch_tool(world, tool, params)
+                        websocket.send_json(
+                            {
+                                "type": "tool.response",
+                                "request_id": request_id,
+                                "result": result,
+                            }
+                        )
+                    except Exception as exc:
+                        websocket.send_json(
+                            {
+                                "type": "tool.response",
+                                "request_id": request_id,
+                                "error": str(exc),
+                            }
+                        )
+                    continue
+
+                if event_type == "chat.tool_status":
+                    if tool_statuses is not None:
+                        payload = envelope.get("payload", {})
+                        tool_statuses.append(str(payload.get("status", "")))
+                    continue
+
+                event_queue.put(envelope)
+                if event_type == "chat.response":
+                    return
+        except BaseException as exc:
+            event_queue.put({"type": "__websocket_error__", "error": exc})
+
+    listener = Thread(target=websocket_loop, daemon=True)
+    listener.start()
+
+    try:
+        response = client.post(
+            "/v1/chat",
+            json={
+                "client_id": client_id,
+                "message": message,
+                "mode": mode,
+            },
+        )
+        response.raise_for_status()
+        chat_id = response.json()["chat_id"]
+
+        for _ in range(max_events):
             try:
-                result = _dispatch_tool(world, tool, params)
-                websocket.send_json(
-                    {
-                        "type": "tool.response",
-                        "request_id": request_id,
-                        "result": result,
-                    }
-                )
-            except Exception as exc:
-                websocket.send_json(
-                    {
-                        "type": "tool.response",
-                        "request_id": request_id,
-                        "error": str(exc),
-                    }
-                )
-            continue
+                envelope = event_queue.get(timeout=_CHAT_EVENT_TIMEOUT_SECONDS)
+            except Empty as exc:
+                raise TimeoutError("chat.response was not received before max_events") from exc
 
-        if event_type == "chat.response" and envelope.get("chat_id") == chat_id:
-            payload = envelope.get("payload", {})
-            return str(payload.get("message", ""))
+            if envelope.get("type") == "__websocket_error__":
+                raise envelope["error"]
 
-    raise TimeoutError("chat.response was not received before max_events")
+            if envelope.get("type") == "chat.response" and envelope.get("chat_id") == chat_id:
+                payload = envelope.get("payload", {})
+                return str(payload.get("message", ""))
+
+        raise TimeoutError("chat.response was not received before max_events")
+    finally:
+        stop_event.set()
 
 
 def assert_region_is(
@@ -230,13 +266,22 @@ def _is_connected(coords: set[tuple[int, int, int]]) -> bool:
 
 
 @pytest.fixture
-def _configured_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+def _configured_settings(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest.Config) -> None:
     spatial_model = (
         os.getenv("ANTHROPIC_SPATIAL_MODEL")
         or os.getenv("ANTHROPIC_CHAT_MODEL")
         or "claude-sonnet-4-6"
     )
     monkeypatch.setenv("ANTHROPIC_CHAT_MODEL", spatial_model)
+    monkeypatch.setenv(
+        "ANTHROPIC_PLANNER_MODEL",
+        os.getenv("ANTHROPIC_SPATIAL_PLANNER_MODEL") or os.getenv("ANTHROPIC_PLANNER_MODEL") or spatial_model,
+    )
+    monkeypatch.setenv(
+        "ANTHROPIC_TRIAGE_MODEL",
+        os.getenv("ANTHROPIC_SPATIAL_TRIAGE_MODEL") or os.getenv("ANTHROPIC_TRIAGE_MODEL") or "claude-haiku-4-5",
+    )
+    monkeypatch.setenv("ANTHROPIC_ENABLE_BUILD_PLANNER", "true" if pytestconfig.getoption("--with-planning") else "false")
     get_settings.cache_clear()
     settings = get_settings()
     if not settings.anthropic_api_key:
@@ -315,6 +360,7 @@ def test_adds_door_on_south_wall_of_existing_room(_configured_settings: None) ->
     assert (0, 65, 2) in door_coords
 
 
+@pytest.mark.quick_spatial
 def test_builds_5_block_tall_pillar(_configured_settings: None) -> None:
     world = HeadlessVoxelWorld()
     world.flat_terrain(radius=24)
@@ -638,7 +684,7 @@ def test_undo_then_rebuild_uses_undo_last(_configured_settings: None) -> None:
     assert_footprint_matches(birch_coords, {(x, 0) for x in range(-2, 3)})
 
 
-@pytest.mark.quick_spatial
+@pytest.mark.planner_spatial
 def test_plan_mode_uses_set_plan_for_3x3_stone_platform(_configured_settings: None) -> None:
     world = HeadlessVoxelWorld()
     world.flat_terrain(radius=24)
