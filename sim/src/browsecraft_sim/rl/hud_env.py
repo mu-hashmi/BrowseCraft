@@ -17,7 +17,11 @@ from .world_setup import build_world, diff_to_blocks, serialize_snapshot
 
 
 ENV_NAME = "browsecraft-spatial-rl"
-_CURRENT_SESSION: contextvars.ContextVar["_ScenarioSession"] = contextvars.ContextVar("browsecraft_rl_session")
+_SCENARIO_SESSION: contextvars.ContextVar["_ScenarioSession | None"] = contextvars.ContextVar(
+    "browsecraft_rl_session",
+    default=None,
+)
+_TOOL_SESSION: "_ScenarioSession | None" = None
 env = Environment(name=ENV_NAME)
 
 
@@ -45,7 +49,10 @@ def _load_task(
     return generate_task(tier=tier, seed=seed, index=index)
 
 
-def _start_session(task: TaskSpec, reward_config: RewardConfig) -> tuple[_ScenarioSession, contextvars.Token[_ScenarioSession]]:
+def _start_session(
+    task: TaskSpec,
+    reward_config: RewardConfig,
+) -> _ScenarioSession:
     world = build_world(task)
     before_snapshot = world.snapshot()
     trace = EpisodeTrace(
@@ -63,15 +70,17 @@ def _start_session(task: TaskSpec, reward_config: RewardConfig) -> tuple[_Scenar
         trace=trace,
         reward_config=reward_config,
     )
-    token = _CURRENT_SESSION.set(session)
-    return session, token
+    return session
 
 
 def _active_session() -> _ScenarioSession:
-    try:
-        return _CURRENT_SESSION.get()
-    except LookupError as exc:
-        raise RuntimeError("tool call outside active scenario session") from exc
+    session = _SCENARIO_SESSION.get()
+    if session is not None:
+        return session
+    session = _TOOL_SESSION
+    if session is None:
+        raise RuntimeError("tool call outside active scenario session")
+    return session
 
 
 def _dispatch(name: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -86,20 +95,30 @@ def _dispatch(name: str, params: dict[str, Any]) -> dict[str, Any]:
         raise
 
 
-def _finish(session: _ScenarioSession) -> float:
+def _score_session(session: _ScenarioSession) -> Any:
     session.trace.ended_at = datetime.now(UTC)
     session.trace.final_world_diff = diff_to_blocks(session.world.diff(session.before_snapshot))
-    breakdown = grade_task(task=session.task, world=session.world, trace=session.trace, config=session.reward_config)
-    return breakdown.reward_normalized
+    return grade_task(task=session.task, world=session.world, trace=session.trace, config=session.reward_config)
+
+
+def _finish(session: _ScenarioSession) -> float:
+    return _score_session(session).reward_normalized
+
+
+def _clear_tool_session() -> None:
+    global _TOOL_SESSION
+    _TOOL_SESSION = None
 
 
 @env.tool()
 async def player_position() -> dict[str, Any]:
+    """Return the current simulated player position and facing."""
     return _dispatch("player_position", {})
 
 
 @env.tool()
 async def player_inventory() -> dict[str, Any]:
+    """Return the simulated player inventory summary."""
     return _dispatch("player_inventory", {})
 
 
@@ -110,6 +129,7 @@ async def inspect_area(
     detailed: bool = False,
     filter_terrain: bool = True,
 ) -> dict[str, Any]:
+    """Inspect blocks around a center point within a cubic radius."""
     return _dispatch(
         "inspect_area",
         {
@@ -123,11 +143,13 @@ async def inspect_area(
 
 @env.tool()
 async def place_blocks(placements: list[dict[str, Any]]) -> dict[str, Any]:
+    """Place explicit block placements at the given coordinates."""
     return _dispatch("place_blocks", {"placements": placements})
 
 
 @env.tool()
 async def fill_region(from_corner: dict[str, int], to_corner: dict[str, int], block_id: str) -> dict[str, Any]:
+    """Fill an axis-aligned region, inclusive of both corners, with one block type."""
     return _dispatch(
         "fill_region",
         {
@@ -140,11 +162,13 @@ async def fill_region(from_corner: dict[str, int], to_corner: dict[str, int], bl
 
 @env.tool()
 async def undo_last() -> dict[str, Any]:
+    """Undo the most recent world-modifying action."""
     return _dispatch("undo_last", {})
 
 
 @env.tool()
 async def get_active_overlay() -> dict[str, Any]:
+    """Return the currently loaded overlay blueprint, if one exists."""
     return _dispatch("get_active_overlay", {})
 
 
@@ -159,6 +183,7 @@ async def modify_overlay(
     from_block: str | None = None,
     to_block: str | None = None,
 ) -> dict[str, Any]:
+    """Transform the active overlay with rotation, translation, pivot, or material swap operations."""
     params: dict[str, Any] = {"op": op}
     if quarters is not None:
         params["quarters"] = quarters
@@ -179,17 +204,73 @@ async def modify_overlay(
 
 @env.tool()
 async def get_blueprints() -> dict[str, Any]:
+    """List saved blueprint names available in the simulator."""
     return _dispatch("get_blueprints", {})
 
 
 @env.tool()
 async def save_blueprint(name: str) -> dict[str, Any]:
+    """Save the active overlay under a blueprint name."""
     return _dispatch("save_blueprint", {"name": name})
 
 
 @env.tool()
 async def load_blueprint(name: str) -> dict[str, Any]:
+    """Load a saved blueprint into the active overlay."""
     return _dispatch("load_blueprint", {"name": name})
+
+
+@env.tool()
+async def rl_setup_task(
+    task_spec: dict[str, Any],
+    reward_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Initialize a legacy HUD eval episode from an explicit RL task spec."""
+    global _TOOL_SESSION
+    if _TOOL_SESSION is not None:
+        raise RuntimeError("task session already active")
+
+    task = TaskSpec.model_validate(task_spec)
+    config = RewardConfig.model_validate(reward_config or {})
+    session = _start_session(task=task, reward_config=config)
+    _TOOL_SESSION = session
+    return {
+        "task_id": task.task_id,
+        "tier": task.tier,
+        "family": task.family,
+        "prompt": task.prompt,
+        "expected_tool_calls": task.expected_tool_calls,
+    }
+
+
+@env.tool()
+async def rl_grade_task() -> dict[str, Any]:
+    """Score the active legacy HUD eval episode and return reward details."""
+    session = _active_session()
+    try:
+        breakdown = _score_session(session)
+        config = session.reward_config
+        return {
+            "reward": breakdown.reward_normalized,
+            "score": breakdown.reward_normalized,
+            "task_id": session.task.task_id,
+            "tier": session.task.tier,
+            "subscores": {
+                "format": breakdown.format_score,
+                "correctness": breakdown.correctness_score,
+                "efficiency": breakdown.efficiency_score,
+                "structural": breakdown.structural_score,
+            },
+            "weights": {
+                "format": config.weight_format,
+                "correctness": config.weight_correctness,
+                "efficiency": config.weight_efficiency,
+                "structural": config.weight_structural,
+            },
+            "details": breakdown.details,
+        }
+    finally:
+        _clear_tool_session()
 
 
 async def _run_scenario(
@@ -202,12 +283,13 @@ async def _run_scenario(
 ) -> Any:
     task = _load_task(tier=tier, task_spec=task_spec, seed=seed, index=index)
     config = RewardConfig.model_validate(reward_config or {})
-    session, token = _start_session(task=task, reward_config=config)
+    session = _start_session(task=task, reward_config=config)
+    token = _SCENARIO_SESSION.set(session)
     try:
         yield task.prompt
         yield _finish(session)
     finally:
-        _CURRENT_SESSION.reset(token)
+        _SCENARIO_SESSION.reset(token)
 
 
 def _register_scenario(tier: Tier, scenario_name: str) -> Any:
