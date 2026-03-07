@@ -12,86 +12,12 @@ from fastapi.testclient import TestClient
 from browsecraft_backend.app import create_app
 from browsecraft_backend.config import get_settings
 from browsecraft_sim.main import HeadlessVoxelWorld, PlayerState, world_bounding_box
+from browsecraft_sim.tool_dispatch import dispatch_tool
 
 
 pytestmark = pytest.mark.spatial
 Coord = tuple[int, int, int]
 _CHAT_EVENT_TIMEOUT_SECONDS = 30.0
-
-
-def _dispatch_tool(world: HeadlessVoxelWorld, tool: str, params: dict[str, Any]) -> dict[str, Any]:
-    if tool == "player_position":
-        return world.player_position()
-    if tool == "player_inventory":
-        return world.player_inventory()
-    if tool == "inspect_area":
-        return world.inspect_area(
-            center=params["center"],
-            radius=int(params["radius"]),
-            detailed=bool(params.get("detailed", False)),
-            filter_terrain=bool(params.get("filter_terrain", True)),
-        )
-    if tool == "place_blocks":
-        placements = params["placements"]
-        if not isinstance(placements, list):
-            raise RuntimeError("place_blocks expects placements list")
-        return world.place_blocks(placements)
-    if tool == "fill_region":
-        return world.fill_region(
-            from_corner=params["from_corner"],
-            to_corner=params["to_corner"],
-            block_id=str(params["block_id"]),
-        )
-    if tool == "set_plan":
-        placements = params.get("placements", [])
-        if not isinstance(placements, list):
-            raise RuntimeError("set_plan expects placements list")
-        return {
-            "loaded_count": len(placements),
-            "overlay": {
-                "has_plan": True,
-                "block_count": len(placements),
-                "anchor": {"x": 0, "y": 0, "z": 0},
-                "rotation_quarter_turns": 0,
-                "preview_mode": True,
-                "confirmed": False,
-                "remaining_count": len(placements),
-            },
-        }
-    if tool == "undo_last":
-        return world.undo_last()
-    if tool == "get_active_overlay":
-        return {
-            "has_plan": False,
-            "block_count": 0,
-            "anchor": {"x": 0, "y": 0, "z": 0},
-            "rotation_quarter_turns": 0,
-            "preview_mode": False,
-            "confirmed": False,
-            "remaining_count": 0,
-        }
-    if tool == "modify_overlay":
-        return {"op": params.get("op")}
-    if tool == "get_blueprints":
-        return {"names": [], "count": 0}
-    if tool == "save_blueprint":
-        return {"name": params.get("name"), "saved": True}
-    if tool == "load_blueprint":
-        return {
-            "name": params.get("name"),
-            "overlay": {
-                "has_plan": False,
-                "block_count": 0,
-                "anchor": {"x": 0, "y": 0, "z": 0},
-                "rotation_quarter_turns": 0,
-                "preview_mode": False,
-                "confirmed": False,
-                "remaining_count": 0,
-            },
-        }
-    raise RuntimeError(f"Unsupported tool: {tool}")
-
-
 def _run_chat_round_trip(
     *,
     client: TestClient,
@@ -123,7 +49,7 @@ def _run_chat_round_trip(
                     if tool_request_payloads is not None:
                         tool_request_payloads.append((str(tool), params))
                     try:
-                        result = _dispatch_tool(world, tool, params)
+                        result = dispatch_tool(world, tool, params)
                         websocket.send_json(
                             {
                                 "type": "tool.response",

@@ -46,3 +46,39 @@ flowchart LR
 - `/materials`
 - `/session new|list|switch <id>`
 - `/build-test` (fallback demo path)
+
+## RL Workflow (HUD + Headless Simulator)
+
+RL development is implemented in `sim/src/browsecraft_sim/rl`.
+
+1. Generate deterministic tiered tasks:
+   ```bash
+   cd ~/BrowseCraft-rl/sim
+   uv run python scripts/generate_hud_tasks.py --seed 7 --per-tier 10 --output remote_tasks.jsonl
+   ```
+2. Verify the HUD environment wiring:
+   ```bash
+   cd ~/BrowseCraft-rl/sim
+   uv run python scripts/run_hud_smoke.py --skip-debug
+   ```
+3. Run local HUD MCP dev server:
+   ```bash
+   cd ~/BrowseCraft-rl/sim
+   hud dev env:env
+   ```
+4. Run baseline evals (Claude only by default):
+   ```bash
+   cd ~/BrowseCraft-rl/sim
+   uv run python scripts/run_baseline_eval.py --tasks-file remote_tasks.jsonl
+   ```
+5. Collect and export trajectories:
+   ```bash
+   cd ~/BrowseCraft-rl/sim
+   uv run python scripts/collect_claude_trajectories.py --model claude-sonnet-4-6 --per-tier 1 --output raw_episodes.jsonl
+   uv run python scripts/export_trajectories.py --input raw_episodes.jsonl --output trajectories.jsonl
+   ```
+6. Export RFT tasks:
+   ```bash
+   cd ~/BrowseCraft-rl/sim
+   uv run python scripts/export_rft_tasks.py --trajectories trajectories.jsonl --output rft_tasks.jsonl
+   ```
