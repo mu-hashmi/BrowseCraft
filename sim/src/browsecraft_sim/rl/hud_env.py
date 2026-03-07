@@ -281,14 +281,19 @@ async def _run_scenario(
     index: int,
     reward_config: dict[str, Any] | None,
 ) -> Any:
+    global _TOOL_SESSION
     task = _load_task(tier=tier, task_spec=task_spec, seed=seed, index=index)
     config = RewardConfig.model_validate(reward_config or {})
     session = _start_session(task=task, reward_config=config)
+    if _TOOL_SESSION is not None:
+        raise RuntimeError("scenario session already active")
     token = _SCENARIO_SESSION.set(session)
+    _TOOL_SESSION = session
     try:
         yield task.prompt
         yield _finish(session)
     finally:
+        _clear_tool_session()
         _SCENARIO_SESSION.reset(token)
 
 
