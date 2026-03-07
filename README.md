@@ -28,10 +28,15 @@ flowchart LR
    cd ~/BrowseCraft/backend && uv run pytest -q
    cd ~/BrowseCraft/mod && gradle test
    ```
-3. Run the backend, launch Minecraft with the built mod, and test commands in-game.
+3. Run everything with one command, or start backend and client manually.
+   ```bash
+   cd ~/BrowseCraft
+   ./scripts/run-everything.sh
+   ```
+   Manual path:
    ```bash
    cd ~/BrowseCraft/backend && uv run browsecraft-backend
-   cd ~/BrowseCraft/mod && gradle build
+   cd ~/BrowseCraft/mod && gradle runClient
    ```
 
 ## Demo Commands
