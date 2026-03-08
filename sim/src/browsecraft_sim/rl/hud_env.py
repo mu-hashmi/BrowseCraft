@@ -9,6 +9,7 @@ from hud import Environment
 
 from browsecraft_sim.tool_dispatch import dispatch_tool
 
+from .agent_config import AGENT_SYSTEM_PROMPT, compose_remote_user_prompt
 from .config import RewardConfig
 from .grader import grade_task
 from .task_generator import generate_task
@@ -60,6 +61,7 @@ def _start_session(
         tier=task.tier,
         seed=task.seed,
         model="",
+        system_prompt=AGENT_SYSTEM_PROMPT,
         initial_world=serialize_snapshot(before_snapshot),
         started_at=datetime.now(UTC),
     )
@@ -129,7 +131,7 @@ async def inspect_area(
     detailed: bool = False,
     filter_terrain: bool = True,
 ) -> dict[str, Any]:
-    """Inspect blocks around a center point within a cubic radius."""
+    """Inspect blocks around a center point. Start broad, use detailed scans only for local confirmation, and recenter instead of repeating the same effective detailed scan because detailed radius clamps at 6."""
     return _dispatch(
         "inspect_area",
         {
@@ -291,7 +293,7 @@ async def _run_scenario(
     token = _SCENARIO_SESSION.set(session)
     _TOOL_SESSION = session
     try:
-        yield task.prompt
+        yield compose_remote_user_prompt(task.prompt)
         yield _finish(session)
     finally:
         _clear_tool_session()

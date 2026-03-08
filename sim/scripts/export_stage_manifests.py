@@ -8,10 +8,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from browsecraft_sim.rl.curriculum import (
+    bootstrap_family_mean_rewards,
     bootstrap_family_success_rates,
+    bootstrap_mean_rewards,
     bootstrap_success_rates,
     curriculum_weights,
+    rolling_family_mean_rewards,
     rolling_family_success_rates,
+    rolling_tier_mean_rewards,
     rolling_tier_success_rates,
     weighted_task_counts,
 )
@@ -173,6 +177,8 @@ def _build_grpo_records(
     build_trajectories: list[EpisodeTrajectoryRecord],
     runs_dir: str | Path,
     total_records: int | None,
+    curriculum_low_reward: float,
+    curriculum_high_reward: float,
 ) -> tuple[list[StageManifestRecord], dict[str, Any]]:
     eligible = [
         record
@@ -180,21 +186,37 @@ def _build_grpo_records(
         if record.task_mode == "build" and record.tier in {"t4_structure_relative", "t5_modification", "t6_composition"}
     ]
     eligible.sort(key=lambda record: (record.tier, record.task_id, record.episode_id))
-    bootstrap_rates = bootstrap_success_rates(
+    bootstrap_mean_rewards_by_tier = bootstrap_mean_rewards(
         runs_dir=runs_dir,
         tiers=("t4_structure_relative", "t5_modification", "t6_composition"),
     )
+    bootstrap_success_rates_by_tier = bootstrap_success_rates(
+        runs_dir=runs_dir,
+        tiers=("t4_structure_relative", "t5_modification", "t6_composition"),
+    )
+    bootstrap_family_mean_rewards_by_family = bootstrap_family_mean_rewards(runs_dir=runs_dir)
     bootstrap_family_rates = bootstrap_family_success_rates(runs_dir=runs_dir)
-    trajectory_rates = rolling_tier_success_rates(
+    trajectory_mean_rewards = rolling_tier_mean_rewards(
+        [{"tier": record.tier, "reward_normalized": record.reward_normalized} for record in eligible],
+        tiers=("t4_structure_relative", "t5_modification", "t6_composition"),
+    )
+    trajectory_success_rates = rolling_tier_success_rates(
         [{"tier": record.tier, "reward_binary": record.reward_binary} for record in eligible],
         tiers=("t4_structure_relative", "t5_modification", "t6_composition"),
+    )
+    trajectory_family_mean_rewards = rolling_family_mean_rewards(
+        [{"task_id": record.task_id, "reward_normalized": record.reward_normalized} for record in eligible]
     )
     trajectory_family_rates = rolling_family_success_rates(
         [{"task_id": record.task_id, "reward_binary": record.reward_binary} for record in eligible]
     )
-    success_rates = dict(bootstrap_rates)
-    success_rates.update(trajectory_rates)
-    weights = curriculum_weights(success_rates)
+    mean_rewards = dict(bootstrap_mean_rewards_by_tier)
+    mean_rewards.update(trajectory_mean_rewards)
+    weights = curriculum_weights(
+        mean_rewards,
+        low=curriculum_low_reward,
+        high=curriculum_high_reward,
+    )
 
     selected = eligible
     if total_records is not None and total_records > 0 and eligible:
@@ -213,7 +235,7 @@ def _build_grpo_records(
                 stage="grpo_stage2",
                 task_mode=record.task_mode,
                 input={"system_prompt": record.system_prompt, "messages": _messages_json(record)},
-                rubric={"reward": record.reward_binary},
+                rubric={"reward": record.reward_normalized},
                 metadata={
                     "task_id": record.task_id,
                     "tier": record.tier,
@@ -229,12 +251,18 @@ def _build_grpo_records(
         for record in selected
     ]
     curriculum = {
+        "bootstrap_family_mean_rewards": bootstrap_family_mean_rewards_by_family,
         "bootstrap_family_success_rates": bootstrap_family_rates,
-        "bootstrap_success_rates": bootstrap_rates,
+        "bootstrap_mean_rewards": bootstrap_mean_rewards_by_tier,
+        "bootstrap_success_rates": bootstrap_success_rates_by_tier,
+        "trajectory_family_mean_rewards": trajectory_family_mean_rewards,
         "trajectory_family_success_rates": trajectory_family_rates,
-        "trajectory_success_rates": trajectory_rates,
-        "effective_success_rates": success_rates,
+        "trajectory_mean_rewards": trajectory_mean_rewards,
+        "trajectory_success_rates": trajectory_success_rates,
+        "effective_mean_rewards": mean_rewards,
         "weights": weights,
+        "curriculum_low_reward": curriculum_low_reward,
+        "curriculum_high_reward": curriculum_high_reward,
         "selected_records": len(records),
         "requested_records": total_records,
     }
@@ -254,6 +282,8 @@ def run(
     runs_dir: str | Path,
     grpo_total_records: int | None,
     curriculum_output: str | None,
+    curriculum_low_reward: float,
+    curriculum_high_reward: float,
 ) -> dict[str, Any]:
     build_trajectories = read_trajectory_jsonl(build_trajectories_path)
     sft_records = _build_sft_records(
@@ -268,6 +298,8 @@ def run(
         build_trajectories=build_trajectories,
         runs_dir=runs_dir,
         total_records=grpo_total_records,
+        curriculum_low_reward=curriculum_low_reward,
+        curriculum_high_reward=curriculum_high_reward,
     )
 
     sft_output.parent.mkdir(parents=True, exist_ok=True)
@@ -304,6 +336,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--grpo-total-records", type=int, default=None)
     parser.add_argument("--curriculum-output", default="runs/grpo_curriculum.json")
+    parser.add_argument("--curriculum-low-reward", type=float, default=0.2)
+    parser.add_argument("--curriculum-high-reward", type=float, default=0.7)
     return parser
 
 
@@ -321,6 +355,8 @@ def main() -> None:
         runs_dir=args.runs_dir,
         grpo_total_records=args.grpo_total_records,
         curriculum_output=args.curriculum_output,
+        curriculum_low_reward=float(args.curriculum_low_reward),
+        curriculum_high_reward=float(args.curriculum_high_reward),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

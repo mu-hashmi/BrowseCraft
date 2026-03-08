@@ -46,6 +46,8 @@ class HeadlessVoxelWorld:
         self.player = player or PlayerState()
         self.blocks: dict[Coord, str] = {}
         self._undo_stack: list[list[tuple[Coord, str]]] = []
+        self._world_revision = 0
+        self._last_inspect_request: dict[str, Any] | None = None
 
     def block_at(self, coord: Coord) -> str:
         return self.blocks.get(coord, "minecraft:air")
@@ -115,6 +117,7 @@ class HeadlessVoxelWorld:
             history.append((coord, self.block_at(coord)))
             self.set_block(coord, block_id)
         self._undo_stack.append(history)
+        self._world_revision += 1
         return {"placed_count": len(placements)}
 
     def fill_region(
@@ -143,6 +146,7 @@ class HeadlessVoxelWorld:
                     history.append((coord, self.block_at(coord)))
                     self.set_block(coord, block_id)
         self._undo_stack.append(history)
+        self._world_revision += 1
         return {
             "placed_count": len(history),
             "fill_region": True,
@@ -164,6 +168,7 @@ class HeadlessVoxelWorld:
         history = self._undo_stack.pop()
         for coord, previous_block in reversed(history):
             self.set_block(coord, previous_block)
+        self._world_revision += 1
         return {"undone_count": len(history)}
 
     def inspect_area(
@@ -178,9 +183,12 @@ class HeadlessVoxelWorld:
         cy = int(center["y"])
         cz = int(center["z"])
         max_radius = 6 if detailed else 12
-        clamped_radius = max(0, min(max_radius, int(radius)))
+        requested_radius = int(radius)
+        clamped_radius = max(0, min(max_radius, requested_radius))
 
         counts: Counter[str] = Counter()
+        visible_counts: Counter[str] = Counter()
+        retained_counts: Counter[str] = Counter()
         non_air_blocks: list[dict[str, Any]] = []
         for dx in range(-clamped_radius, clamped_radius + 1):
             for dy in range(-clamped_radius, clamped_radius + 1):
@@ -190,11 +198,16 @@ class HeadlessVoxelWorld:
                     z = cz + dz
                     block_id = self.block_at((x, y, z))
                     counts[block_id] += 1
+                    if not filter_terrain or (
+                        block_id != "minecraft:air" and not _is_terrain_block(block_id, y)
+                    ):
+                        visible_counts[block_id] += 1
                     if (
                         detailed
                         and block_id != "minecraft:air"
                         and not (filter_terrain and _is_terrain_block(block_id, y))
                     ):
+                        retained_counts[block_id] += 1
                         non_air_blocks.append(
                             {
                                 "x": x,
@@ -204,17 +217,55 @@ class HeadlessVoxelWorld:
                             }
                         )
 
+        previous_request = self._last_inspect_request
+        current_request = {
+            "center": (cx, cy, cz),
+            "effective_radius": clamped_radius,
+            "requested_radius": requested_radius,
+            "detailed": detailed,
+            "filter_terrain": filter_terrain,
+            "world_revision": self._world_revision,
+        }
+        redundant_with_previous = bool(
+            previous_request is not None
+            and previous_request["center"] == current_request["center"]
+            and previous_request["effective_radius"] == current_request["effective_radius"]
+            and previous_request["detailed"] == current_request["detailed"]
+            and previous_request["filter_terrain"] == current_request["filter_terrain"]
+            and previous_request["world_revision"] == current_request["world_revision"]
+        )
+        effective_radius_unchanged = bool(
+            redundant_with_previous
+            and detailed
+            and previous_request is not None
+            and previous_request["requested_radius"] != requested_radius
+        )
+        self._last_inspect_request = current_request
+
+        filtered_counts = dict(sorted(visible_counts.items() if filter_terrain else counts.items()))
+
         result = {
-            "requested_radius": int(radius),
+            "requested_radius": requested_radius,
             "radius": clamped_radius,
             "sampled_blocks": (2 * clamped_radius + 1) ** 3,
             "center": {"x": cx, "y": cy, "z": cz},
-            "block_counts": dict(sorted(counts.items())),
             "detailed": detailed,
             "filter_terrain": filter_terrain,
+            "radius_clamped": requested_radius != clamped_radius,
+            "redundant_with_previous": redundant_with_previous,
+            "effective_radius_unchanged": effective_radius_unchanged,
         }
         if detailed:
+            result["retained_block_count"] = len(non_air_blocks)
+            result["retained_bbox"] = (
+                _bbox_dict((block["x"], block["y"], block["z"]) for block in non_air_blocks)
+                if non_air_blocks
+                else None
+            )
+            result["top_block_ids"] = _top_block_ids(retained_counts)
             result["non_air_blocks"] = non_air_blocks
+            return result
+        result["block_counts"] = filtered_counts
         return result
 
     def player_position(self) -> dict[str, Any]:
@@ -454,6 +505,10 @@ def _is_terrain_block(block_id: str, y: int) -> bool:
     if block_id == "minecraft:stone" and y <= 63:
         return True
     return block_id in _TERRAIN_BLOCK_IDS
+
+
+def _top_block_ids(counts: Counter[str], *, limit: int = 4) -> list[dict[str, Any]]:
+    return [{"block_id": block_id, "count": count} for block_id, count in counts.most_common(limit)]
 
 
 def build_parser() -> argparse.ArgumentParser:

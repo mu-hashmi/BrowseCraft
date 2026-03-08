@@ -23,7 +23,7 @@ def _trajectory_to_rft_task(record: EpisodeTrajectoryRecord) -> RftTaskRecord:
         "system_prompt": record.system_prompt,
         "messages": [message.model_dump(mode="json") for message in record.messages],
     }
-    rubric = {"reward": record.reward_binary}
+    rubric = {"reward": record.reward_normalized}
     metadata = {
         "episode_id": record.episode_id,
         "task_id": record.task_id,

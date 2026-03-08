@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from browsecraft_sim.rl.agent_config import compose_remote_user_prompt
+
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[2] / "sim" / "scripts" / "import_hud_job.py"
 _SPEC = importlib.util.spec_from_file_location("browsecraft_import_hud_job", _SCRIPT_PATH)
@@ -102,6 +104,29 @@ def test_final_assistant_blocks_accepts_chat_completion_result() -> None:
             "input": {"placements": [{"x": 1, "y": 64, "z": 2, "block_id": "minecraft:stone"}]},
         },
     ]
+
+
+def test_normalize_task_prompt_message_rewrites_wrapped_remote_prompt() -> None:
+    task_prompt = "Build the structure."
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": compose_remote_user_prompt(task_prompt)}],
+        }
+    ]
+
+    normalized = _MODULE._normalize_task_prompt_message(messages, task_prompt=task_prompt)
+
+    assert normalized[0]["content"][0]["text"] == task_prompt
+
+
+def test_classify_failure_mode_detects_context_window_errors() -> None:
+    assert (
+        _MODULE._classify_failure_mode(
+            "Prompt length plus max_tokens exceeds the model's context window: 36421 prompt tokens + 512 max_tokens > 32768."
+        )
+        == "context_window_exceeded"
+    )
 
 
 @pytest.mark.anyio

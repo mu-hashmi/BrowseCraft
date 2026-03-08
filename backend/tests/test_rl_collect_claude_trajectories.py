@@ -98,6 +98,8 @@ def test_grpo_stage_uses_runtime_curriculum_updates(monkeypatch, tmp_path) -> No
         total_tasks=5,
         curriculum_runs_dir=str(tmp_path / "runs"),
         curriculum_threshold=0.8,
+        curriculum_low_reward=0.2,
+        curriculum_high_reward=0.7,
         curriculum_update_every=2,
         max_rounds=4,
         concurrency=1,
@@ -112,7 +114,10 @@ def test_grpo_stage_uses_runtime_curriculum_updates(monkeypatch, tmp_path) -> No
     assert args._sampling_summary["strategy"] == "curriculum"
     assert args._sampling_summary["bootstrap_source"] == "none"
     assert args._sampling_summary["updates"][0]["completed_episodes"] == 2
+    assert args._sampling_summary["updates"][0]["family_mean_rewards"]["t5_modification:fake"] == 0.5
     assert args._sampling_summary["updates"][0]["family_success_rates"]["t5_modification:fake"] == 0.5
+    assert args._sampling_summary["updates"][0]["mean_rewards"]["t5_modification"] == 0.5
     assert args._sampling_summary["updates"][0]["weights"]["t5_modification"] == 2
+    assert args._sampling_summary["final_family_mean_rewards"]["t5_modification:fake"] == 0.5
     assert args._sampling_summary["final_family_success_rates"]["t5_modification:fake"] == 0.5
     assert _FakeRandom.instances[0].weight_history[2] == [1, 2, 1]

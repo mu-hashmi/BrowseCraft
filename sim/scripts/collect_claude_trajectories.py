@@ -12,12 +12,17 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
+from browsecraft_sim.rl.agent_config import INSPECT_AREA_TOOL_DESCRIPTION, TEACHER_TRAJECTORY_SYSTEM_PROMPT
 from browsecraft_sim.rl.config import RewardConfig
 from browsecraft_sim.rl.curriculum import (
+    bootstrap_family_mean_rewards,
     bootstrap_family_success_rates,
+    bootstrap_mean_rewards,
     bootstrap_success_rates,
     curriculum_weights,
+    rolling_family_mean_rewards,
     rolling_family_success_rates,
+    rolling_tier_mean_rewards,
     rolling_tier_success_rates,
 )
 from browsecraft_sim.rl.grader import grade_task
@@ -28,14 +33,6 @@ from browsecraft_sim.rl.world_setup import build_world, diff_to_blocks, serializ
 from browsecraft_sim.tool_dispatch import dispatch_tool
 
 
-_SYSTEM_PROMPT = (
-    "You are a Minecraft building agent operating in a headless simulator.\n"
-    "Use tools to inspect state and place blocks.\n"
-    "Coordinates use +x east, +y up, +z south.\n"
-    "Do not assume missing world information; inspect before complex modifications.\n"
-    "Prefer exact coordinate placement when task provides absolute targets.\n"
-    "Do not add unrelated blocks."
-)
 _CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral"}
 
 _TOOLS = [
@@ -51,7 +48,7 @@ _TOOLS = [
     },
     {
         "name": "inspect_area",
-        "description": "Inspect blocks around a center with a radius.",
+        "description": INSPECT_AREA_TOOL_DESCRIPTION,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -179,12 +176,13 @@ def _initial_curriculum_weights(
     *,
     runs_dir: str | Path,
     tiers: list[Tier],
-    threshold: float,
+    low_reward: float,
+    high_reward: float,
 ) -> tuple[dict[str, float], dict[str, int], str]:
     if not _has_curriculum_bootstrap(runs_dir):
         return {}, {tier: 1 for tier in tiers}, "none"
-    success_rates = bootstrap_success_rates(runs_dir=runs_dir, tiers=tiers, threshold=threshold)
-    return success_rates, curriculum_weights(success_rates), "baseline"
+    mean_rewards = bootstrap_mean_rewards(runs_dir=runs_dir, tiers=tiers)
+    return mean_rewards, curriculum_weights(mean_rewards, low=low_reward, high=high_reward), "baseline"
 
 
 def _updated_curriculum_weights(
@@ -192,18 +190,18 @@ def _updated_curriculum_weights(
     rows: list[dict[str, Any]],
     current_weights: dict[str, int],
     tiers: list[Tier],
-    threshold: float,
     window_size: int,
+    low_reward: float,
+    high_reward: float,
 ) -> tuple[dict[str, float], dict[str, int]]:
-    success_rates = rolling_tier_success_rates(
-        [{"tier": row["trace"]["tier"], "reward_binary": row["reward_binary"]} for row in rows],
+    mean_rewards = rolling_tier_mean_rewards(
+        [{"tier": row["trace"]["tier"], "reward_normalized": row["reward_normalized"]} for row in rows],
         window_size=window_size,
-        threshold=threshold,
         tiers=tiers,
     )
     updated = {tier: current_weights.get(tier, 1) for tier in tiers}
-    updated.update(curriculum_weights(success_rates))
-    return success_rates, updated
+    updated.update(curriculum_weights(mean_rewards, low=low_reward, high=high_reward))
+    return mean_rewards, updated
 
 
 def _parse_tiers(raw: str | None, *, stage: str) -> list[Tier]:
@@ -241,7 +239,7 @@ async def _warmup_prompt_cache(client: AsyncAnthropic, *, model: str) -> None:
         max_tokens=1,
         cache_control=_CACHE_CONTROL_EPHEMERAL,
         temperature=0,
-        system=[{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": _CACHE_CONTROL_EPHEMERAL}],
+        system=[{"type": "text", "text": TEACHER_TRAJECTORY_SYSTEM_PROMPT, "cache_control": _CACHE_CONTROL_EPHEMERAL}],
         tools=_CACHEABLE_TOOLS,
         messages=[{"role": "user", "content": [{"type": "text", "text": "warmup"}]}],
     )
@@ -262,7 +260,7 @@ async def _run_episode(
         tier=task.tier,
         seed=task.seed,
         model=model,
-        system_prompt=_SYSTEM_PROMPT,
+        system_prompt=TEACHER_TRAJECTORY_SYSTEM_PROMPT,
         initial_world=serialize_snapshot(before_snapshot),
         started_at=datetime.now(UTC),
     )
@@ -279,7 +277,7 @@ async def _run_episode(
             max_tokens=768,
             cache_control=_CACHE_CONTROL_EPHEMERAL,
             temperature=0,
-            system=[{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": _CACHE_CONTROL_EPHEMERAL}],
+            system=[{"type": "text", "text": TEACHER_TRAJECTORY_SYSTEM_PROMPT, "cache_control": _CACHE_CONTROL_EPHEMERAL}],
             tools=_CACHEABLE_TOOLS,
             messages=messages,
         )
@@ -394,11 +392,18 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
         total_tasks = args.total_tasks if args.total_tasks > 0 else args.per_tier * len(tiers)
         if total_tasks <= 0:
             raise ValueError("curriculum sampling requires --total-tasks > 0 or --per-tier > 0")
-        bootstrap_rates, weights, bootstrap_source = _initial_curriculum_weights(
+        bootstrap_mean_rewards_by_tier, weights, bootstrap_source = _initial_curriculum_weights(
+            runs_dir=args.curriculum_runs_dir,
+            tiers=tiers,
+            low_reward=args.curriculum_low_reward,
+            high_reward=args.curriculum_high_reward,
+        )
+        bootstrap_success_rates_by_tier = bootstrap_success_rates(
             runs_dir=args.curriculum_runs_dir,
             tiers=tiers,
             threshold=args.curriculum_threshold,
         )
+        bootstrap_family_mean_rewards_by_family = bootstrap_family_mean_rewards(runs_dir=args.curriculum_runs_dir)
         bootstrap_family_rates = bootstrap_family_success_rates(
             runs_dir=args.curriculum_runs_dir,
             threshold=args.curriculum_threshold,
@@ -408,9 +413,13 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "tiers": tiers,
             "total_tasks": total_tasks,
             "bootstrap_source": bootstrap_source,
+            "bootstrap_family_mean_rewards": bootstrap_family_mean_rewards_by_family,
             "bootstrap_family_success_rates": bootstrap_family_rates,
-            "bootstrap_success_rates": bootstrap_rates,
+            "bootstrap_mean_rewards": bootstrap_mean_rewards_by_tier,
+            "bootstrap_success_rates": bootstrap_success_rates_by_tier,
             "initial_weights": weights,
+            "curriculum_low_reward": args.curriculum_low_reward,
+            "curriculum_high_reward": args.curriculum_high_reward,
             "update_every": args.curriculum_update_every,
             "updates": [],
         }
@@ -488,11 +497,28 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
                     for key in usage_totals:
                         usage_totals[key] += int(row["usage"][key])
                     if completed % args.curriculum_update_every == 0 and completed < total_tasks:
-                        success_rates, weights = _updated_curriculum_weights(
+                        mean_rewards, weights = _updated_curriculum_weights(
                             rows=rows,
                             current_weights=weights,
                             tiers=tiers,
+                            window_size=args.curriculum_update_every,
+                            low_reward=args.curriculum_low_reward,
+                            high_reward=args.curriculum_high_reward,
+                        )
+                        success_rates = rolling_tier_success_rates(
+                            [{"tier": row["trace"]["tier"], "reward_binary": row["reward_binary"]} for row in rows],
+                            window_size=args.curriculum_update_every,
                             threshold=args.curriculum_threshold,
+                            tiers=tiers,
+                        )
+                        family_mean_rewards = rolling_family_mean_rewards(
+                            [
+                                {
+                                    "task_id": row["trace"]["task_id"],
+                                    "reward_normalized": row["reward_normalized"],
+                                }
+                                for row in rows
+                            ],
                             window_size=args.curriculum_update_every,
                         )
                         family_success_rates = rolling_family_success_rates(
@@ -509,7 +535,9 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
                         sampling_summary["updates"].append(
                             {
                                 "completed_episodes": completed,
+                                "family_mean_rewards": family_mean_rewards,
                                 "family_success_rates": family_success_rates,
+                                "mean_rewards": mean_rewards,
                                 "success_rates": success_rates,
                                 "weights": dict(weights),
                             }
@@ -528,6 +556,16 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
                             flush=True,
                         )
             sampling_summary["final_weights"] = dict(weights)
+            sampling_summary["final_family_mean_rewards"] = rolling_family_mean_rewards(
+                [
+                    {
+                        "task_id": row["trace"]["task_id"],
+                        "reward_normalized": row["reward_normalized"],
+                    }
+                    for row in rows
+                ],
+                window_size=args.curriculum_update_every,
+            )
             sampling_summary["final_family_success_rates"] = rolling_family_success_rates(
                 [
                     {
@@ -538,6 +576,17 @@ async def _run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 ],
                 window_size=args.curriculum_update_every,
                 threshold=args.curriculum_threshold,
+            )
+            sampling_summary["final_mean_rewards"] = rolling_tier_mean_rewards(
+                [{"tier": row["trace"]["tier"], "reward_normalized": row["reward_normalized"]} for row in rows],
+                window_size=args.curriculum_update_every,
+                tiers=tiers,
+            )
+            sampling_summary["final_success_rates"] = rolling_tier_success_rates(
+                [{"tier": row["trace"]["tier"], "reward_binary": row["reward_binary"]} for row in rows],
+                window_size=args.curriculum_update_every,
+                threshold=args.curriculum_threshold,
+                tiers=tiers,
             )
         args._sampling_summary = sampling_summary
         return rows
@@ -556,6 +605,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--total-tasks", type=int, default=0)
     parser.add_argument("--curriculum-runs-dir", default="runs")
     parser.add_argument("--curriculum-threshold", type=float, default=0.8)
+    parser.add_argument("--curriculum-low-reward", type=float, default=0.2)
+    parser.add_argument("--curriculum-high-reward", type=float, default=0.7)
     parser.add_argument("--curriculum-update-every", type=int, default=100)
     parser.add_argument("--max-rounds", type=int, default=12)
     parser.add_argument("--concurrency", type=int, default=4)

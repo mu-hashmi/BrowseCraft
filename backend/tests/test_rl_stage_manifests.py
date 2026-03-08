@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from browsecraft_sim.rl.prompt_variants import PromptVariantRecord, write_prompt_variants_jsonl
 from browsecraft_sim.rl.text_qa import generate_text_qa_task, write_text_qa_jsonl
 from browsecraft_sim.rl.trajectory import AnthropicMessage, EpisodeTrajectoryRecord, write_trajectory_jsonl
@@ -20,6 +22,7 @@ StageManifestRecord = _MODULE.StageManifestRecord
 
 
 def _trajectory_record(*, task_id: str, tier: str, prompt: str, reward_binary: float) -> EpisodeTrajectoryRecord:
+    reward_normalized = 0.9 if reward_binary else 0.2
     return EpisodeTrajectoryRecord(
         episode_id=f"{task_id}-episode",
         task_id=task_id,
@@ -35,8 +38,8 @@ def _trajectory_record(*, task_id: str, tier: str, prompt: str, reward_binary: f
         tool_round_count=1,
         tool_call_count=1,
         grader={"correctness": reward_binary},
-        reward_raw=0.9 if reward_binary else 0.2,
-        reward_normalized=0.9 if reward_binary else 0.2,
+        reward_raw=reward_normalized,
+        reward_normalized=reward_normalized,
         reward_binary=reward_binary,
         final_world_diff=[],
         started_at="2026-03-07T00:00:00+00:00",
@@ -140,10 +143,12 @@ def test_export_stage_manifests_builds_sft_and_weighted_grpo_outputs(tmp_path) -
         runs_dir=runs_dir,
         grpo_total_records=4,
         curriculum_output=str(curriculum_output),
+        curriculum_low_reward=0.1,
+        curriculum_high_reward=0.5,
     )
 
     assert summary["sft_stage1"] == 7
-    assert summary["grpo_stage2"] == 4
+    assert summary["grpo_stage2"] == 3
 
     sft_records = _read_stage_records(sft_output)
     build_records = [record for record in sft_records if record.metadata["source"] == "build_trajectory"]
@@ -156,13 +161,17 @@ def test_export_stage_manifests_builds_sft_and_weighted_grpo_outputs(tmp_path) -
     tier_counts = {tier: 0 for tier in ("t4_structure_relative", "t5_modification", "t6_composition")}
     for record in grpo_records:
         tier_counts[record.metadata["tier"]] += 1
-        assert record.rubric == {"reward": record.metadata["reward_binary"]}
+        assert record.rubric == {"reward": record.metadata["reward_normalized"]}
     assert tier_counts == {
         "t4_structure_relative": 1,
-        "t5_modification": 2,
+        "t5_modification": 1,
         "t6_composition": 1,
     }
 
     curriculum = json.loads(curriculum_output.read_text(encoding="utf-8"))
-    assert curriculum["weights"]["t5_modification"] == 2
+    assert curriculum["curriculum_low_reward"] == 0.1
+    assert curriculum["curriculum_high_reward"] == 0.5
+    assert curriculum["weights"]["t4_structure_relative"] == 1
+    assert curriculum["weights"]["t5_modification"] == 1
+    assert curriculum["trajectory_mean_rewards"]["t5_modification"] == pytest.approx(0.55)
     assert curriculum["trajectory_family_success_rates"]["t5_modification:add_window_to_wall"] == 0.0

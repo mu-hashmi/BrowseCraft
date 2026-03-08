@@ -4,6 +4,9 @@ import asyncio
 
 import pytest
 
+from browsecraft_sim.rl.agent_config import compose_remote_user_prompt
+from browsecraft_sim.rl.task_generator import generate_task
+
 
 def test_hud_env_registers_expected_tools_and_scenarios() -> None:
     pytest.importorskip("hud")
@@ -41,7 +44,8 @@ def test_hud_scenario_generator_protocol_round_trip() -> None:
 
     async def _run() -> None:
         prompt = await env.run_scenario_setup("t1_absolute", {"seed": 17, "index": 0, "reward_config": {}})
-        assert isinstance(prompt, str) and prompt
+        expected_task = generate_task(tier="t1_absolute", seed=17, index=0)
+        assert prompt == compose_remote_user_prompt(expected_task.prompt)
         await env.submit("t1_absolute", "")
         result = await env.run_scenario_evaluate("t1_absolute")
         assert 0.0 <= result.reward <= 1.0

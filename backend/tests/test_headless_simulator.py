@@ -44,3 +44,36 @@ def test_diff_report_counts_added_removed_and_updated() -> None:
     assert report["updated_count"] == 1
     assert report["removed_count"] == 0
     assert report["bbox"]["min"] == {"x": 0, "y": 64, "z": 0}
+
+
+def test_inspect_area_filters_air_and_terrain_in_non_detailed_mode() -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=2)
+    world.place_blocks([{"x": 0, "y": 64, "z": 0, "block_id": "minecraft:stone"}])
+
+    result = world.inspect_area(center={"x": 0, "y": 64, "z": 0}, radius=2, filter_terrain=True)
+
+    assert result["detailed"] is False
+    assert result["block_counts"] == {"minecraft:stone": 1}
+    assert "minecraft:air" not in result["block_counts"]
+    assert "minecraft:grass_block" not in result["block_counts"]
+    assert "minecraft:dirt" not in result["block_counts"]
+
+
+def test_detailed_inspect_area_returns_compact_summary_and_redundancy_feedback() -> None:
+    world = HeadlessVoxelWorld()
+    world.flat_terrain(radius=2)
+    world.place_blocks([{"x": 0, "y": 64, "z": 0, "block_id": "minecraft:stone"}])
+
+    first = world.inspect_area(center={"x": 0, "y": 64, "z": 0}, radius=20, detailed=True, filter_terrain=True)
+    second = world.inspect_area(center={"x": 0, "y": 64, "z": 0}, radius=30, detailed=True, filter_terrain=True)
+
+    assert first["radius"] == 6
+    assert first["radius_clamped"] is True
+    assert "block_counts" not in first
+    assert first["retained_block_count"] == 1
+    assert first["top_block_ids"] == [{"block_id": "minecraft:stone", "count": 1}]
+    assert first["redundant_with_previous"] is False
+    assert first["effective_radius_unchanged"] is False
+    assert second["redundant_with_previous"] is True
+    assert second["effective_radius_unchanged"] is True

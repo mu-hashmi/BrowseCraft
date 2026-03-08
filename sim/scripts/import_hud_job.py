@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean
@@ -12,7 +12,7 @@ from typing import Any
 import anyio
 import httpx
 
-from browsecraft_sim.rl.agent_config import AGENT_SYSTEM_PROMPT
+from browsecraft_sim.rl.agent_config import AGENT_SYSTEM_PROMPT, is_remote_user_prompt
 from browsecraft_sim.rl.config import RewardConfig
 from browsecraft_sim.rl.grader import grade_task
 from browsecraft_sim.rl.trajectory import validate_anthropic_messages
@@ -24,6 +24,7 @@ from browsecraft_sim.tool_dispatch import dispatch_tool
 _HUD_MCP_URL = "https://api.hud.ai/v3/mcp/"
 _IGNORED_TOOL_SPANS = {"_hud_submit", "rl_setup_task", "rl_grade_task"}
 _HUD_MAX_ATTEMPTS = 5
+_WORLD_MODIFYING_TOOLS = {"place_blocks", "fill_region", "undo_last"}
 
 
 def _parse_iso8601(value: str) -> datetime:
@@ -128,6 +129,84 @@ def _normalize_request_message(message: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_request_messages(raw_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [_normalize_request_message(message) for message in raw_messages]
+
+
+def _normalize_task_prompt_message(messages: list[dict[str, Any]], *, task_prompt: str) -> list[dict[str, Any]]:
+    if not messages:
+        return messages
+    first = messages[0]
+    if first.get("role") != "user":
+        return messages
+    content = first.get("content")
+    if not isinstance(content, list):
+        return messages
+    for block in content:
+        if block.get("type") != "text":
+            continue
+        prompt_text = block.get("text")
+        if prompt_text == task_prompt:
+            return messages
+        if isinstance(prompt_text, str) and is_remote_user_prompt(prompt_text, task_prompt):
+            block["text"] = task_prompt
+            return messages
+        return messages
+    return messages
+
+
+def _classify_failure_mode(error_text: str | None) -> str | None:
+    if not error_text:
+        return None
+    normalized = error_text.casefold()
+    if "context_window_exceeded" in normalized or "context window" in normalized:
+        return "context_window_exceeded"
+    if "timeout" in normalized:
+        return "timeout"
+    if "invalid arguments" in normalized or "expects" in normalized:
+        return "invalid_arguments"
+    if "tool error" in normalized:
+        return "tool_error"
+    return "other_error"
+
+
+def _tool_diagnostics(tool_calls: list[ToolCallRecord]) -> dict[str, int]:
+    inspect_call_count = 0
+    redundant_inspect_count = 0
+    effective_radius_unchanged_count = 0
+    tool_error_count = 0
+    current_non_modifying_streak = 0
+    max_non_modifying_streak = 0
+
+    for tool_call in tool_calls:
+        if not tool_call.success:
+            tool_error_count += 1
+        if tool_call.name in _WORLD_MODIFYING_TOOLS:
+            current_non_modifying_streak = 0
+        else:
+            current_non_modifying_streak += 1
+            max_non_modifying_streak = max(max_non_modifying_streak, current_non_modifying_streak)
+        if tool_call.name != "inspect_area":
+            continue
+        inspect_call_count += 1
+        if bool(tool_call.args.get("redundant_with_previous", False)):
+            redundant_inspect_count += 1
+        if bool(tool_call.args.get("effective_radius_unchanged", False)):
+            effective_radius_unchanged_count += 1
+
+    return {
+        "inspect_call_count": inspect_call_count,
+        "redundant_inspect_count": redundant_inspect_count,
+        "effective_radius_unchanged_count": effective_radius_unchanged_count,
+        "tool_error_count": tool_error_count,
+        "max_non_modifying_streak": max_non_modifying_streak,
+    }
+
+
+def _reward_bucket(reward: float, *, success_threshold: float = 0.8) -> str:
+    if reward <= 0.0:
+        return "zero"
+    if reward >= success_threshold:
+        return "success"
+    return "partial"
 
 
 def _final_assistant_blocks(span: dict[str, Any]) -> list[dict[str, Any]]:
@@ -244,6 +323,11 @@ def _build_raw_row(payload: dict[str, Any], *, reward_tolerance: float) -> tuple
     tool_calls: list[ToolCallRecord] = []
     model_name = ""
     format_valid = True
+    inspect_call_count = 0
+    redundant_inspect_count = 0
+    effective_radius_unchanged_count = 0
+    current_non_modifying_streak = 0
+    max_non_modifying_streak = 0
 
     for span in inference_spans:
         attributes = span["attributes"]
@@ -252,6 +336,7 @@ def _build_raw_row(payload: dict[str, Any], *, reward_tolerance: float) -> tuple
         if response_model:
             model_name = model_name or _normalize_model_name(response_model)
         request_messages = _normalize_request_messages(request_params["messages"])
+        request_messages = _normalize_task_prompt_message(request_messages, task_prompt=task.prompt)
         if messages and request_messages[: len(messages)] != messages:
             raise ValueError(f"trace message history diverged for {payload['trace_id']}")
         messages = request_messages
@@ -298,6 +383,11 @@ def _build_raw_row(payload: dict[str, Any], *, reward_tolerance: float) -> tuple
         result = span["attributes"]["result"]
         result_text = _extract_text_blocks(result.get("content"))
         is_error = bool(result.get("isError"))
+        if tool_name in _WORLD_MODIFYING_TOOLS:
+            current_non_modifying_streak = 0
+        else:
+            current_non_modifying_streak += 1
+            max_non_modifying_streak = max(max_non_modifying_streak, current_non_modifying_streak)
         tool_calls.append(
             ToolCallRecord(
                 name=tool_name,
@@ -309,7 +399,13 @@ def _build_raw_row(payload: dict[str, Any], *, reward_tolerance: float) -> tuple
         if is_error:
             format_valid = False
             continue
-        dispatch_tool(world, tool_name, arguments)
+        result_payload = dispatch_tool(world, tool_name, arguments)
+        if tool_name == "inspect_area":
+            inspect_call_count += 1
+            if bool(result_payload.get("redundant_with_previous", False)):
+                redundant_inspect_count += 1
+            if bool(result_payload.get("effective_radius_unchanged", False)):
+                effective_radius_unchanged_count += 1
 
     if queued_tool_uses:
         raise ValueError(f"unmatched tool uses for trace {payload['trace_id']}: {[item[0] for item in queued_tool_uses]}")
@@ -340,6 +436,13 @@ def _build_raw_row(payload: dict[str, Any], *, reward_tolerance: float) -> tuple
         )
 
     usage = payload["metadata"].get("usage", {})
+    diagnostics = {
+        "inspect_call_count": inspect_call_count,
+        "redundant_inspect_count": redundant_inspect_count,
+        "effective_radius_unchanged_count": effective_radius_unchanged_count,
+        "tool_error_count": sum(1 for tool_call in tool_calls if not tool_call.success),
+        "max_non_modifying_streak": max_non_modifying_streak,
+    }
     row = {
         "trace": trace.model_dump(mode="json"),
         "model": model_name,
@@ -347,6 +450,7 @@ def _build_raw_row(payload: dict[str, Any], *, reward_tolerance: float) -> tuple
         "reward_raw": breakdown.reward_raw,
         "reward_normalized": breakdown.reward_normalized,
         "reward_binary": breakdown.reward_binary,
+        "diagnostics": diagnostics,
         "usage": {
             "input_tokens": int(usage.get("total_input_tokens", 0)),
             "output_tokens": int(usage.get("total_output_tokens", 0)),
@@ -361,6 +465,11 @@ def _build_raw_row(payload: dict[str, Any], *, reward_tolerance: float) -> tuple
         "reward_normalized": breakdown.reward_normalized,
         "reward_binary": breakdown.reward_binary,
         "tool_call_count": trace.tool_call_count,
+        "inspect_call_count": diagnostics["inspect_call_count"],
+        "redundant_inspect_count": diagnostics["redundant_inspect_count"],
+        "effective_radius_unchanged_count": diagnostics["effective_radius_unchanged_count"],
+        "tool_error_count": diagnostics["tool_error_count"],
+        "max_non_modifying_streak": diagnostics["max_non_modifying_streak"],
     }
     return row, summary
 
@@ -384,6 +493,9 @@ def _read_existing_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[str
         payload = json.loads(stripped)
         trace = payload["trace"]
         grader = payload["grader"]
+        diagnostics = payload.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = _tool_diagnostics([ToolCallRecord.model_validate(tool_call) for tool_call in trace["tool_calls"]])
         rows.append(payload)
         imported_trace_ids.add(trace["episode_id"])
         summaries.append(
@@ -394,6 +506,11 @@ def _read_existing_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[str
                 "reward_normalized": float(payload["reward_normalized"]),
                 "reward_binary": float(payload["reward_binary"]),
                 "tool_call_count": int(grader["details"]["actual_tool_calls"]),
+                "inspect_call_count": int(diagnostics["inspect_call_count"]),
+                "redundant_inspect_count": int(diagnostics["redundant_inspect_count"]),
+                "effective_radius_unchanged_count": int(diagnostics["effective_radius_unchanged_count"]),
+                "tool_error_count": int(diagnostics["tool_error_count"]),
+                "max_non_modifying_streak": int(diagnostics["max_non_modifying_streak"]),
             }
         )
     return rows, summaries, imported_trace_ids
@@ -422,16 +539,32 @@ async def run(
     ) as client:
         job = await _call_hud_tool(client=client, name="get_job", arguments={"job_id": job_id})
         traces = await _call_hud_tool(client=client, name="get_job_traces", arguments={"job_id": job_id})
+        status_counts = Counter(trace["status"] for trace in traces["traces"])
 
         skipped_traces: list[dict[str, Any]] = []
+        skipped_failure_modes: Counter[str] = Counter()
         for trace_summary in traces["traces"]:
             if trace_summary["status"] != "completed":
+                fetch_error: str | None = None
+                failure_mode: str | None = None
+                if trace_summary["status"] == "error" or bool(trace_summary.get("has_error")):
+                    try:
+                        await _fetch_trace_payload(client=client, trace_id=trace_summary["trace_id"])
+                    except Exception as exc:
+                        fetch_error = str(exc)
+                        failure_mode = _classify_failure_mode(fetch_error)
+                    else:
+                        failure_mode = "unknown_error"
+                    if failure_mode is not None:
+                        skipped_failure_modes[failure_mode] += 1
                 skipped_traces.append(
                     {
                         "trace_id": trace_summary["trace_id"],
                         "status": trace_summary["status"],
                         "reward": trace_summary.get("reward"),
                         "has_error": trace_summary.get("has_error"),
+                        "likely_failure_mode": failure_mode,
+                        "fetch_error": fetch_error,
                     }
                 )
                 continue
@@ -460,21 +593,44 @@ async def run(
     for item in summaries:
         grouped[(item["tier"], item["family"])].append(item)
 
-    family_summary = [
-        {
-            "tier": tier,
-            "family": family,
-            "n": len(items),
-            "mean_reward": mean(item["reward_normalized"] for item in items),
-            "success_rate": mean(item["reward_binary"] for item in items),
-            "mean_tool_calls": mean(item["tool_call_count"] for item in items),
-        }
-        for (tier, family), items in sorted(grouped.items())
-    ]
+    family_summary = []
+    for (tier, family), items in sorted(grouped.items()):
+        zero_count = sum(1 for item in items if _reward_bucket(float(item["reward_normalized"])) == "zero")
+        partial_count = sum(1 for item in items if _reward_bucket(float(item["reward_normalized"])) == "partial")
+        success_count = sum(1 for item in items if _reward_bucket(float(item["reward_normalized"])) == "success")
+        if success_count == len(items):
+            family_status = "all_successes"
+        elif success_count == 0 and partial_count == 0:
+            family_status = "all_zero"
+        elif success_count == 0:
+            family_status = "partial_only"
+        else:
+            family_status = "mixed_with_success"
+        family_summary.append(
+            {
+                "tier": tier,
+                "family": family,
+                "n": len(items),
+                "mean_reward": mean(item["reward_normalized"] for item in items),
+                "success_rate": mean(item["reward_binary"] for item in items),
+                "zero_count": zero_count,
+                "partial_count": partial_count,
+                "success_count": success_count,
+                "status": family_status,
+                "mean_tool_calls": mean(item["tool_call_count"] for item in items),
+                "mean_inspect_calls": mean(item["inspect_call_count"] for item in items),
+                "mean_redundant_inspects": mean(item["redundant_inspect_count"] for item in items),
+                "mean_effective_radius_unchanged": mean(item["effective_radius_unchanged_count"] for item in items),
+                "mean_tool_errors": mean(item["tool_error_count"] for item in items),
+                "max_non_modifying_streak": max(item["max_non_modifying_streak"] for item in items),
+            }
+        )
     summary = {
         "job": job,
         "imported_traces": len(rows),
+        "status_counts": dict(status_counts),
         "skipped_traces": skipped_traces,
+        "skipped_failure_modes": dict(skipped_failure_modes),
         "output": str(output_path.resolve()),
         "families": family_summary,
     }
