@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "browsecraft",
+  "version": "${version}",
+  "name": "BrowseCraft",
+  "description": "Minecraft build assistant mod for BrowseCraft",
+  "authors": ["BrowseCraft"],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.browsecraft.mod.BrowseCraftClient"
+    ],
+    "fabric-client-gametest": [
+      "dev.browsecraft.mod.BrowseCraftClientGameTests",
+      "dev.browsecraft.mod.BrowseCraftHudClientGameTests"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.21.11",
+    "java": ">=21"
+  }
+}

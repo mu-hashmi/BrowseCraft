@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#13233a"/>
+      <stop offset="100%" stop-color="#264d2f"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="420" fill="url(#bg)"/>
+  <rect x="60" y="56" width="1080" height="308" rx="16" fill="#0b1018" stroke="#5da8ff" stroke-width="2"/>
+  <text x="100" y="145" fill="#ffffff" font-family="Menlo, Consolas, monospace" font-size="64">BrowseCraft</text>
+  <text x="100" y="200" fill="#9fc6ff" font-family="Menlo, Consolas, monospace" font-size="28">Natural language to Minecraft structures, overlays, and edits</text>
+  <text x="100" y="262" fill="#8fd8a2" font-family="Menlo, Consolas, monospace" font-size="24">/build • /imagine • /chat • /blueprints • /materials • /session</text>
+  <text x="100" y="320" fill="#d7e3f4" font-family="Menlo, Consolas, monospace" font-size="20">Hackathon prototype: FastAPI + Fabric mod + bidirectional WebSocket agent tools</text>
+</svg>

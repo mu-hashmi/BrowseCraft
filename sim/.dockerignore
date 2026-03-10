@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+runs
+remote_tasks.jsonl
+eval_tasks.jsonl
+raw_episodes.jsonl
+hud.lock.yaml

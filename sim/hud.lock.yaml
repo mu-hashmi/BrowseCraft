@@ -1,0 +1,849 @@
+version: '1.3'
+images:
+  local: sim:0.1.3
+  full: sim:0.1.3@sha256:e142b6d9e51f797e4b841a61efb8cb5a4be12664c3eabc3bcb012f00cd6c6de1
+  pushed: muhashmii/sim:0.1.3
+build:
+  generatedAt: 2026-03-07T00:17:28.560100+00:00Z
+  hudVersion: 0.5.29
+  directory: sim
+  version: 0.1.3
+  sourceHash: 9a9dcd0f3a75436b222bae784036198b4e6b7e3fa1dd388b7861ee6d3282790d
+  baseImage: python:3.12-slim
+  platform: linux/amd64
+  sourceFiles:
+  - Dockerfile
+  - pyproject.toml
+environment:
+  initializeMs: 7305
+  toolCount: 13
+  runtime:
+    python: 3.12.13
+    cuda: null
+    cudnn: null
+    pytorch: null
+  internalToolCount: 0
+tools:
+- name: player_position
+  description: Return the current simulated player position and facing.
+  inputSchema:
+    properties: {}
+    type: object
+- name: player_inventory
+  description: Return the simulated player inventory summary.
+  inputSchema:
+    properties: {}
+    type: object
+- name: inspect_area
+  description: Inspect blocks around a center point within a cubic radius.
+  inputSchema:
+    properties:
+      center:
+        additionalProperties:
+          type: integer
+        type: object
+      radius:
+        type: integer
+      detailed:
+        default: false
+        type: boolean
+      filter_terrain:
+        default: true
+        type: boolean
+    required:
+    - center
+    - radius
+    type: object
+- name: place_blocks
+  description: Place explicit block placements at the given coordinates.
+  inputSchema:
+    properties:
+      placements:
+        items:
+          additionalProperties: true
+          type: object
+        type: array
+    required:
+    - placements
+    type: object
+- name: fill_region
+  description: Fill an axis-aligned region, inclusive of both corners, with one block
+    type.
+  inputSchema:
+    properties:
+      from_corner:
+        additionalProperties:
+          type: integer
+        type: object
+      to_corner:
+        additionalProperties:
+          type: integer
+        type: object
+      block_id:
+        type: string
+    required:
+    - from_corner
+    - to_corner
+    - block_id
+    type: object
+- name: undo_last
+  description: Undo the most recent world-modifying action.
+  inputSchema:
+    properties: {}
+    type: object
+- name: get_active_overlay
+  description: Return the currently loaded overlay blueprint, if one exists.
+  inputSchema:
+    properties: {}
+    type: object
+- name: modify_overlay
+  description: Transform the active overlay with rotation, translation, pivot, or
+    material swap operations.
+  inputSchema:
+    properties:
+      op:
+        type: string
+      quarters:
+        anyOf:
+        - type: integer
+        - type: 'null'
+        default: null
+      dy:
+        anyOf:
+        - type: integer
+        - type: 'null'
+        default: null
+      x:
+        anyOf:
+        - type: integer
+        - type: 'null'
+        default: null
+      y:
+        anyOf:
+        - type: integer
+        - type: 'null'
+        default: null
+      z:
+        anyOf:
+        - type: integer
+        - type: 'null'
+        default: null
+      from_block:
+        anyOf:
+        - type: string
+        - type: 'null'
+        default: null
+      to_block:
+        anyOf:
+        - type: string
+        - type: 'null'
+        default: null
+    required:
+    - op
+    type: object
+- name: get_blueprints
+  description: List saved blueprint names available in the simulator.
+  inputSchema:
+    properties: {}
+    type: object
+- name: save_blueprint
+  description: Save the active overlay under a blueprint name.
+  inputSchema:
+    properties:
+      name:
+        type: string
+    required:
+    - name
+    type: object
+- name: load_blueprint
+  description: Load a saved blueprint into the active overlay.
+  inputSchema:
+    properties:
+      name:
+        type: string
+    required:
+    - name
+    type: object
+- name: rl_setup_task
+  description: Initialize a legacy HUD eval episode from an explicit RL task spec.
+  inputSchema:
+    properties:
+      task_spec:
+        additionalProperties: true
+        type: object
+      reward_config:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+        default: null
+    required:
+    - task_spec
+    type: object
+- name: rl_grade_task
+  description: Score the active legacy HUD eval episode and return reward details.
+  inputSchema:
+    properties: {}
+    type: object
+prompts:
+- name: browsecraft-spatial-rl:t1_absolute
+  description: '[Setup] Scenario: t1_absolute'
+  arguments: &id013
+  - name: task_spec
+    required: false
+    description: null
+    default: null
+    inputSchema: &id001
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  - name: seed
+    required: false
+    description: null
+    default: 7
+    type: integer
+  - name: index
+    required: false
+    description: null
+    default: 0
+    type: integer
+  - name: reward_config
+    required: false
+    description: null
+    default: null
+    inputSchema: &id002
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema: *id001
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema: *id002
+    _fastmcp:
+      tags: []
+- name: browsecraft-spatial-rl:t2_relative_single_ref
+  description: '[Setup] Scenario: t2_relative_single_ref'
+  arguments: &id014
+  - name: task_spec
+    required: false
+    description: null
+    default: null
+    inputSchema: &id003
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  - name: seed
+    required: false
+    description: null
+    default: 7
+    type: integer
+  - name: index
+    required: false
+    description: null
+    default: 0
+    type: integer
+  - name: reward_config
+    required: false
+    description: null
+    default: null
+    inputSchema: &id004
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema: *id003
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema: *id004
+    _fastmcp:
+      tags: []
+- name: browsecraft-spatial-rl:t3_primitives
+  description: '[Setup] Scenario: t3_primitives'
+  arguments: &id015
+  - name: task_spec
+    required: false
+    description: null
+    default: null
+    inputSchema: &id005
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  - name: seed
+    required: false
+    description: null
+    default: 7
+    type: integer
+  - name: index
+    required: false
+    description: null
+    default: 0
+    type: integer
+  - name: reward_config
+    required: false
+    description: null
+    default: null
+    inputSchema: &id006
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema: *id005
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema: *id006
+    _fastmcp:
+      tags: []
+- name: browsecraft-spatial-rl:t4_structure_relative
+  description: '[Setup] Scenario: t4_structure_relative'
+  arguments: &id016
+  - name: task_spec
+    required: false
+    description: null
+    default: null
+    inputSchema: &id007
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  - name: seed
+    required: false
+    description: null
+    default: 7
+    type: integer
+  - name: index
+    required: false
+    description: null
+    default: 0
+    type: integer
+  - name: reward_config
+    required: false
+    description: null
+    default: null
+    inputSchema: &id008
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema: *id007
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema: *id008
+    _fastmcp:
+      tags: []
+- name: browsecraft-spatial-rl:t5_modification
+  description: '[Setup] Scenario: t5_modification'
+  arguments: &id017
+  - name: task_spec
+    required: false
+    description: null
+    default: null
+    inputSchema: &id009
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  - name: seed
+    required: false
+    description: null
+    default: 7
+    type: integer
+  - name: index
+    required: false
+    description: null
+    default: 0
+    type: integer
+  - name: reward_config
+    required: false
+    description: null
+    default: null
+    inputSchema: &id010
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema: *id009
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema: *id010
+    _fastmcp:
+      tags: []
+- name: browsecraft-spatial-rl:t6_composition
+  description: '[Setup] Scenario: t6_composition'
+  arguments: &id018
+  - name: task_spec
+    required: false
+    description: null
+    default: null
+    inputSchema: &id011
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  - name: seed
+    required: false
+    description: null
+    default: 7
+    type: integer
+  - name: index
+    required: false
+    description: null
+    default: 0
+    type: integer
+  - name: reward_config
+    required: false
+    description: null
+    default: null
+    inputSchema: &id012
+      anyOf:
+      - additionalProperties: true
+        type: object
+      - type: 'null'
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema: *id011
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema: *id012
+    _fastmcp:
+      tags: []
+resources:
+- uri: browsecraft-spatial-rl:t1_absolute
+  name: t1_absolute
+  description: '[Evaluate] Scenario: t1_absolute'
+  mime_type: application/json
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    _fastmcp:
+      tags: []
+- uri: browsecraft-spatial-rl:t2_relative_single_ref
+  name: t2_relative_single_ref
+  description: '[Evaluate] Scenario: t2_relative_single_ref'
+  mime_type: application/json
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    _fastmcp:
+      tags: []
+- uri: browsecraft-spatial-rl:t3_primitives
+  name: t3_primitives
+  description: '[Evaluate] Scenario: t3_primitives'
+  mime_type: application/json
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    _fastmcp:
+      tags: []
+- uri: browsecraft-spatial-rl:t4_structure_relative
+  name: t4_structure_relative
+  description: '[Evaluate] Scenario: t4_structure_relative'
+  mime_type: application/json
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    _fastmcp:
+      tags: []
+- uri: browsecraft-spatial-rl:t5_modification
+  name: t5_modification
+  description: '[Evaluate] Scenario: t5_modification'
+  mime_type: application/json
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    _fastmcp:
+      tags: []
+- uri: browsecraft-spatial-rl:t6_composition
+  name: t6_composition
+  description: '[Evaluate] Scenario: t6_composition'
+  mime_type: application/json
+  meta:
+    code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+      \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int\
+      \ = 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n\
+      \        async for item in _run_scenario(\n            tier=tier,\n        \
+      \    task_spec=task_spec,\n            seed=seed,\n            index=index,\n\
+      \            reward_config=reward_config,\n        ):\n            yield item\n"
+    arguments:
+    - name: task_spec
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    - name: seed
+      required: false
+      default: 7
+      type: integer
+    - name: index
+      required: false
+      default: 0
+      type: integer
+    - name: reward_config
+      required: false
+      default: null
+      inputSchema:
+        anyOf:
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+    _fastmcp:
+      tags: []
+scenarios:
+- id: browsecraft-spatial-rl:t1_absolute
+  env: browsecraft-spatial-rl
+  name: t1_absolute
+  setup_description: '[Setup] Scenario: t1_absolute'
+  arguments: *id013
+  has_setup_prompt: true
+  has_evaluate_resource: true
+  code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+    \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int =\
+    \ 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n  \
+    \      async for item in _run_scenario(\n            tier=tier,\n            task_spec=task_spec,\n\
+    \            seed=seed,\n            index=index,\n            reward_config=reward_config,\n\
+    \        ):\n            yield item\n"
+  evaluate_description: '[Evaluate] Scenario: t1_absolute'
+- id: browsecraft-spatial-rl:t2_relative_single_ref
+  env: browsecraft-spatial-rl
+  name: t2_relative_single_ref
+  setup_description: '[Setup] Scenario: t2_relative_single_ref'
+  arguments: *id014
+  has_setup_prompt: true
+  has_evaluate_resource: true
+  code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+    \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int =\
+    \ 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n  \
+    \      async for item in _run_scenario(\n            tier=tier,\n            task_spec=task_spec,\n\
+    \            seed=seed,\n            index=index,\n            reward_config=reward_config,\n\
+    \        ):\n            yield item\n"
+  evaluate_description: '[Evaluate] Scenario: t2_relative_single_ref'
+- id: browsecraft-spatial-rl:t3_primitives
+  env: browsecraft-spatial-rl
+  name: t3_primitives
+  setup_description: '[Setup] Scenario: t3_primitives'
+  arguments: *id015
+  has_setup_prompt: true
+  has_evaluate_resource: true
+  code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+    \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int =\
+    \ 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n  \
+    \      async for item in _run_scenario(\n            tier=tier,\n            task_spec=task_spec,\n\
+    \            seed=seed,\n            index=index,\n            reward_config=reward_config,\n\
+    \        ):\n            yield item\n"
+  evaluate_description: '[Evaluate] Scenario: t3_primitives'
+- id: browsecraft-spatial-rl:t4_structure_relative
+  env: browsecraft-spatial-rl
+  name: t4_structure_relative
+  setup_description: '[Setup] Scenario: t4_structure_relative'
+  arguments: *id016
+  has_setup_prompt: true
+  has_evaluate_resource: true
+  code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+    \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int =\
+    \ 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n  \
+    \      async for item in _run_scenario(\n            tier=tier,\n            task_spec=task_spec,\n\
+    \            seed=seed,\n            index=index,\n            reward_config=reward_config,\n\
+    \        ):\n            yield item\n"
+  evaluate_description: '[Evaluate] Scenario: t4_structure_relative'
+- id: browsecraft-spatial-rl:t5_modification
+  env: browsecraft-spatial-rl
+  name: t5_modification
+  setup_description: '[Setup] Scenario: t5_modification'
+  arguments: *id017
+  has_setup_prompt: true
+  has_evaluate_resource: true
+  code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+    \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int =\
+    \ 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n  \
+    \      async for item in _run_scenario(\n            tier=tier,\n            task_spec=task_spec,\n\
+    \            seed=seed,\n            index=index,\n            reward_config=reward_config,\n\
+    \        ):\n            yield item\n"
+  evaluate_description: '[Evaluate] Scenario: t5_modification'
+- id: browsecraft-spatial-rl:t6_composition
+  env: browsecraft-spatial-rl
+  name: t6_composition
+  setup_description: '[Setup] Scenario: t6_composition'
+  arguments: *id018
+  has_setup_prompt: true
+  has_evaluate_resource: true
+  code: "    @env.scenario(scenario_name)\n    async def _scenario(\n        task_spec:\
+    \ dict[str, Any] | None = None,\n        seed: int = 7,\n        index: int =\
+    \ 0,\n        reward_config: dict[str, Any] | None = None,\n    ) -> Any:\n  \
+    \      async for item in _run_scenario(\n            tier=tier,\n            task_spec=task_spec,\n\
+    \            seed=seed,\n            index=index,\n            reward_config=reward_config,\n\
+    \        ):\n            yield item\n"
+  evaluate_description: '[Evaluate] Scenario: t6_composition'
+push:
+  source: sim:0.1.3
+  pushedAt: '2026-03-07T22:22:29.065240Z'
+  registry: docker.io
+  image_with_tag: muhashmii/sim:0.1.3

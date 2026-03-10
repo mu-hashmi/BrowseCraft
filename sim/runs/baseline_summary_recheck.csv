@@ -1,0 +1,12 @@
+tier,family,n,mean_reward,std_reward,min_reward,max_reward,mean_correctness,mean_structural,p25_tool_calls,p50_tool_calls,p75_tool_calls,p90_tool_calls
+t1_absolute,absolute_single_block,25,1.0,0.0,1.0,1.0,1.0,1.0,1,1,1,1.0
+t2_relative_single_ref,relative_single_reference,25,1.0,0.0,1.0,1.0,1.0,1.0,2,2,2,2.0
+t3_primitives,floor,11,1.0,0.0,1.0,1.0,1.0,1.0,1.0,1,1.0,1
+t3_primitives,tower,10,1.0,0.0,1.0,1.0,1.0,1.0,2.0,2.0,2.0,2.0999999999999996
+t3_primitives,wall,4,0.525,0.0,0.525,0.525,0.5,0.75,3.0,3.0,3.0,3.0
+t4_structure_relative,south_face_marker,15,0.34,0.39799497484264795,0.10000000000000002,1.0,0.26666666666666666,1.0,4.0,4,4.0,4.0
+t4_structure_relative,top_of_tower,10,1.0,0.0,1.0,1.0,1.0,1.0,4.0,4.0,5.0,5.0
+t5_modification,replace_material_preserve_shape,11,0.7159090909090909,0.4385244793717501,0.0,1.0,1.0,1.0,7.5,8,8.0,9
+t5_modification,widen_or_reposition_opening,14,0.6900000000000001,0.0,0.6900000000000001,0.6900000000000001,0.7666666666666666,0.0,3.0,3.0,4.0,4.0
+t6_composition,bridge_between_structures,9,0.0,0.0,0.0,0.0,0.0,0.0,6,6,6,6.0
+t6_composition,connect_rooms_with_corridor,16,0.37160116792929304,0.25613677470918517,0.0,0.6225000000000002,0.5135901424963925,0.5722222222222222,7.0,8.0,8.0,9.5
